@@ -1,0 +1,33 @@
+# 单机部署：docker compose up -d   （访问 http://127.0.0.1:8000）
+# 默认全部使用本地实现（零密钥）。要接真实模型/向量库，改 environment 后重启即可。
+services:
+  finonto:
+    build: .
+    image: finonto:0.1.0
+    ports:
+      - "8000:8000"
+    environment:
+      FINONTO_DATA_DIR: /app/data
+      FINONTO_AUTO_BOOTSTRAP: "true"
+      # 接真实模型时取消注释（镜像内需自行 pip install 相应 SDK）
+      # FINONTO_LLM_PROVIDER: openai_compat:dashscope
+      # FINONTO_LLM_API_KEY: sk-xxxx
+      # 切换 pgvector 时同时启用 postgres：
+      #   docker compose --profile pgvector up -d
+      # FINONTO_VECTOR_STORE: pgvector
+      # FINONTO_DATABASE_URL: postgresql+psycopg://finonto:finonto@postgres:5432/finonto
+    volumes:
+      - ./data/finonto:/app/data
+    restart: unless-stopped
+
+  # 可选组件：只在 FINONTO_VECTOR_STORE=pgvector 时需要
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: ["pgvector"]
+    environment:
+      POSTGRES_USER: finonto
+      POSTGRES_PASSWORD: finonto
+      POSTGRES_DB: finonto
+    volumes:
+      - ./data/pgdata:/var/lib/postgresql/data
+    restart: unless-stopped

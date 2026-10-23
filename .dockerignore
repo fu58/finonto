@@ -1,0 +1,11 @@
+server/.venv/
+server/var/
+server/app/__pycache__/
+**/__pycache__/
+**/*.pyc
+client/node_modules/
+client/dist/
+client/var-dev.log
+.git/
+.env
+server/.env

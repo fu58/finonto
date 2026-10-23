@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: finonto-data
+  labels:
+    app: finonto
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: finonto
+  labels:
+    app: finonto
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: finonto
+  template:
+    metadata:
+      labels:
+        app: finonto
+    spec:
+      containers:
+        - name: finonto
+          image: finonto:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: FINONTO_DATA_DIR
+              value: /app/data
+            - name: FINONTO_AUTO_BOOTSTRAP
+              value: "true"
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: finonto-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: finonto
+  labels:
+    app: finonto
+spec:
+  selector:
+    app: finonto
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000

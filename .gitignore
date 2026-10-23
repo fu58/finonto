@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 运行期数据（SQLite、对象存储、上传件、沙箱工作区、组件选择状态）
+server/var/
+client/var-dev.log
+data/finonto/
+data/pgdata/
+
+# 本地密钥
+.env
+server/.env
