@@ -1,0 +1,9 @@
+# FinOnto 运行时依赖（Python 3.11+）
+# 设计目标：依赖尽量少——前端零第三方、配置零 pydantic-settings、上传零 multipart。
+
+fastapi>=0.110,<1.0
+uvicorn>=0.27,<1.0
+jinja2>=3.1,<4.0
+markupsafe>=2.1,<4.0
+sqlalchemy>=2.0,<3.0
+numpy>=1.26,<3.0
