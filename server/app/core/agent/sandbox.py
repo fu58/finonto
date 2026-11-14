@@ -101,7 +101,9 @@ def run(code: str) -> dict[str, Any]:
     import subprocess
     import sys
 
-    workdir = Path(settings.sandbox_dir)
+    # 必须转成绝对路径：子进程会 chdir 到 workdir，
+    # 相对路径在那里会被二次拼接（CI 上 FINONTO_DATA_DIR 是相对路径时必现）
+    workdir = Path(settings.sandbox_dir).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     script = workdir / f"run_{int(time.time() * 1000)}.py"
     script.write_text(code, encoding="utf-8")
