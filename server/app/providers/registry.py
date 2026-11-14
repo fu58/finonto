@@ -1,505 +1,406 @@
-"""组件注册表：按配置装配 Provider，支持运行时切换并持久化选择。
+"""组件注册表：目录、构建、切换、探针。
 
-`describe()` 给出全部可选组件（含未配置的厂商 / 向量库 / 存储 / 渠道），
-供前端「组件设置」页展示与切换；`切换后的实现` 写入 var/components.json，
-重启仍然生效，且不会改动 .env。
+设计要点
+--------
+* **目录与实现分离**：``CATALOG`` 只描述「有哪些、要不要密钥、可不可用」，
+  构建逻辑在 ``build_components()``，前端只需读目录就能渲染组件中心。
+* **切换落盘**：``activate()`` 写 ``var/components.json``，重启仍生效（优先级高于环境变量）。
+* **探针不抛错**：``probe()`` 永远返回结构化结果，前端拿它渲染连通性。
 """
 
 from __future__ import annotations
 
 import json
-import threading
-from pathlib import Path
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
-import numpy as np
-
-from ..config import Settings, get_settings
+from ..config import COMPONENT_KEYS, Settings, get_settings
 from .base import (
-    ChatMessage,
     DocParser,
     EmbeddingProvider,
     IMChannel,
     LLMProvider,
+    Message,
     ObjectStore,
-    ProviderInfo,
-    VectorHit,
+    Reranker,
     VectorStore,
     WebSearch,
 )
-from .datasource.connectors import (
-    DataSource,
-    FileDataSource,
-    HttpJsonDataSource,
-    JdbcDataSource,
-    SQLiteDataSource,
-)
-from .docparser.parsers import DefaultDocParser
-from .embedding.local_hash import LocalHashEmbedder
-from .embedding.openai_compat import OpenAICompatEmbedder
-from .im.channels import (
-    ConsoleChannel,
-    DingTalkChannel,
-    FeishuChannel,
-    SlackChannel,
-    WeComChannel,
-)
-from .llm.mock import MockLLMProvider
-from .llm.openai_compat import OpenAICompatProvider
-from .objectstore.stores import LocalFSObjectStore, OSSObjectStore
-from .search.web import ApiKeyWebSearch, DuckDuckGoSearch, NoopWebSearch
-from .vectorstore.external import DashVectorStore, PgVectorStore
-from .vectorstore.sqlite_numpy import SqliteNumpyVectorStore
-
-LLM_VENDORS: list[dict[str, str]] = [
-    {"key": "dashscope", "display": "阿里云百炼 / 通义千问", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus"},
-    {"key": "openai", "display": "OpenAI", "base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini"},
-    {"key": "deepseek", "display": "DeepSeek", "base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
-    {"key": "moonshot", "display": "月之暗面 Kimi", "base_url": "https://api.moonshot.cn/v1", "model": "moonshot-v1-32k"},
-    {"key": "zhipu", "display": "智谱 GLM", "base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-plus"},
-    {"key": "volc", "display": "火山方舟豆包", "base_url": "https://ark.cn-beijing.volces.com/api/v3", "model": "doubao-pro-32k"},
-    {"key": "vllm", "display": "自建 vLLM / OpenAI 兼容网关", "base_url": "http://127.0.0.1:8000/v1", "model": "Qwen2.5-32B-Instruct"},
-    {"key": "ollama", "display": "本机 Ollama", "base_url": "http://127.0.0.1:11434/v1", "model": "qwen2.5:14b"},
-]
-
-DEPLOY_TARGETS: list[dict[str, str]] = [
-    {"key": "local", "display": "本机 uvicorn + Vite dev", "hint": "scripts/dev.sh（Windows 用 scripts\\dev.ps1）"},
-    {"key": "docker", "display": "Docker Compose 单机", "hint": "docker compose up -d，见 docker-compose.yml"},
-    {"key": "k8s", "display": "Kubernetes / Helm", "hint": "kubectl apply -f deploy/k8s/finonto.yaml（Deployment + Service + PVC）"},
-    {"key": "serverless", "display": "函数计算 / Serverless", "hint": "需要外部 Postgres + OSS + NAS，见 README「部署形态」"},
-    {"key": "edge", "display": "内网隔离部署（零外呼）", "hint": "provider 全用本地实现 + 自建 vLLM，见 README「部署形态」"},
-]
-
-_STATE_LOCK = threading.RLock()
+from .docparser import DefaultMultiFormatParser
+from .embedding import LocalHashEmbedding, OpenAICompatEmbedding
+from .im import IM_IMPLEMENTATIONS, LogOnlyIM
+from .llm import VENDORS, MockLLM, OpenAICompatLLM
+from .objectstore import LocalFSObjectStore
+from .rerank import CrossEncoderReranker, HeuristicReranker, LLMReranker
+from .search import BochaSearch, DuckDuckGoSearch, NoWebSearch, SerperSearch, TavilySearch
+from .vectorstore import MemoryVectorStore, PgVectorStore, SqliteNumpyVectorStore
 
 
-class InMemoryVectorStore:
-    """供测试与临时命名空间使用。"""
+# --------------------------------------------------------------------------- #
+# 组件目录（前端「组件中心」直接渲染这个）
+# --------------------------------------------------------------------------- #
+CATALOG: dict[str, list[dict[str, Any]]] = {
+    "llm": [
+        {"key": "mock", "display": "本地抽取式（mock）", "needs_key": False,
+         "note": "零外呼，可完整跑通问答/本体/Agent/Wiki"},
+        *[
+            {
+                "key": f"openai_compat:{vendor}",
+                "display": profile["display"],
+                "needs_key": True,
+                "note": f"OpenAI 兼容 · 默认模型 {profile['model']}",
+            }
+            for vendor, profile in VENDORS.items()
+        ],
+    ],
+    "embedding": [
+        {"key": "local_hash", "display": "本地特征哈希（384 维）", "needs_key": False,
+         "note": "确定性、零依赖；换真实模型后需重建索引"},
+        {"key": "openai_compat", "display": "OpenAI 兼容 embeddings", "needs_key": True,
+         "note": "百炼 / OpenAI / 自建 bge-m3 等"},
+    ],
+    "vector_store": [
+        {"key": "sqlite_numpy", "display": "SQLite + numpy", "needs_key": False, "note": "默认，十万级片段"},
+        {"key": "memory", "display": "进程内存", "needs_key": False, "note": "测试用，重启即失"},
+        {"key": "pgvector", "display": "pgvector", "needs_key": True, "note": "需 psycopg 与 vector 扩展"},
+    ],
+    "object_store": [
+        {"key": "local_fs", "display": "本地文件系统", "needs_key": False, "note": "var/objects"},
+        {"key": "s3", "display": "S3 / OSS 兼容", "needs_key": True, "note": "需 boto3"},
+    ],
+    "doc_parser": [
+        {"key": "default_multi_format", "display": "内置多格式解析", "needs_key": False,
+         "note": "txt/md/csv/json/html/xml/log/docx/xlsx/pdf"},
+    ],
+    "data_source": [
+        {"key": "auto", "display": "按 URI 前缀自动路由", "needs_key": False,
+         "note": "local:// file:// sqlite:// http(s):// mysql+pymysql://"},
+        {"key": "file", "display": "本地文件", "needs_key": False, "note": "local:// / file://"},
+        {"key": "sqlite", "display": "SQLite 表导出", "needs_key": False, "note": "?table=名称&limit=N"},
+        {"key": "http_json", "display": "HTTP / JSON", "needs_key": False, "note": "拉取远端文件"},
+        {"key": "jdbc", "display": "数据库查询（JDBC 等价）", "needs_key": True, "note": "?sql=SELECT ..."},
+    ],
+    "web_search": [
+        {"key": "none", "display": "关闭（内网默认）", "needs_key": False, "note": "search.* 工具返回已关闭"},
+        {"key": "duckduckgo", "display": "DuckDuckGo", "needs_key": False, "note": "免密钥，演示用"},
+        {"key": "tavily", "display": "Tavily", "needs_key": True, "note": "结果质量好"},
+        {"key": "bocha", "display": "博查", "needs_key": True, "note": "国内可用"},
+        {"key": "serper", "display": "Serper", "needs_key": True, "note": "Google 结果"},
+    ],
+    "im_channel": [
+        {"key": "none", "display": "仅日志", "needs_key": False, "note": "通知写到服务日志"},
+        {"key": "dingtalk", "display": "钉钉机器人", "needs_key": True, "note": "markdown 消息"},
+        {"key": "feishu", "display": "飞书机器人", "needs_key": True, "note": "text 消息"},
+        {"key": "wecom", "display": "企业微信机器人", "needs_key": True, "note": "markdown 消息"},
+        {"key": "slack", "display": "Slack", "needs_key": True, "note": "incoming webhook"},
+    ],
+    "rerank": [
+        {"key": "heuristic", "display": "启发式（可解释）", "needs_key": False, "note": "覆盖度+密度+权威度"},
+        {"key": "llm", "display": "LLM pointwise", "needs_key": True, "note": "让模型给候选打分"},
+        {"key": "cross_encoder", "display": "本地 cross-encoder", "needs_key": False,
+         "note": "需 sentence-transformers，缺失时自动退回启发式"},
+    ],
+    "deploy_target": [
+        {"key": "local", "display": "本机", "needs_key": False, "note": "python -m app.main"},
+        {"key": "docker", "display": "Docker Compose", "needs_key": False, "note": "单镜像 8000"},
+        {"key": "k8s", "display": "Kubernetes", "needs_key": False, "note": "deploy/k8s/finonto.yaml"},
+        {"key": "serverless", "display": "Serverless / 函数计算", "needs_key": True,
+         "note": "需外部 Postgres + 对象存储"},
+        {"key": "edge", "display": "边缘节点", "needs_key": True, "note": "本地模型 + 本地存储"},
+    ],
+}
 
-    name = "memory"
+CATEGORY_LABELS = {
+    "llm": "对话/推理模型",
+    "embedding": "向量化",
+    "vector_store": "向量数据库",
+    "object_store": "对象存储",
+    "doc_parser": "文档格式",
+    "data_source": "数据源",
+    "web_search": "网络搜索",
+    "im_channel": "IM 渠道",
+    "rerank": "重排序",
+    "deploy_target": "部署目标",
+}
 
-    def __init__(self) -> None:
-        self._data: dict[str, dict[int, tuple[np.ndarray, dict]]] = {}
+#: 配置项名（Settings 字段 / components.json 的 key）→ 目录 key
+COMPONENT_TO_CATALOG: dict[str, str] = {
+    "llm_provider": "llm",
+    "embedding_provider": "embedding",
+    "vector_store": "vector_store",
+    "object_store": "object_store",
+    "doc_parser": "doc_parser",
+    "data_source": "data_source",
+    "web_search": "web_search",
+    "im_channel": "im_channel",
+    "rerank_provider": "rerank",
+    "deploy_target": "deploy_target",
+}
 
-    def upsert(self, namespace: str, vectors: dict[int, np.ndarray], meta: dict[int, dict] | None = None) -> int:
-        meta = meta or {}
-        bucket = self._data.setdefault(namespace, {})
-        for ref_id, vec in vectors.items():
-            bucket[ref_id] = (np.asarray(vec, dtype=np.float32), meta.get(ref_id, {}))
-        return len(vectors)
-
-    def delete(self, namespace: str, ref_ids: list[int]) -> int:
-        bucket = self._data.get(namespace, {})
-        for ref_id in ref_ids:
-            bucket.pop(ref_id, None)
-        return len(ref_ids)
-
-    def search(self, namespace: str, vector: np.ndarray, top_k: int, filters: dict | None = None) -> list[VectorHit]:
-        bucket = self._data.get(namespace, {})
-        query = np.asarray(vector, dtype=np.float32)
-        norm = float(np.linalg.norm(query)) or 1.0
-        scored: list[VectorHit] = []
-        for ref_id, (vec, meta) in bucket.items():
-            if filters and not all(meta.get(k) == v for k, v in filters.items()):
-                continue
-            scored.append(VectorHit(ref_id=ref_id, score=float(vec @ query / norm), meta=meta))
-        scored.sort(key=lambda h: -h.score)
-        return scored[:top_k]
-
-    def count(self, namespace: str) -> int:
-        return len(self._data.get(namespace, {}))
+#: 每个配置项对应的密钥字段（只回显「是否已配置」）
+SECRET_BY_COMPONENT: dict[str, str] = {
+    "llm_provider": "llm_api_key",
+    "embedding_provider": "embedding_api_key",
+    "object_store": "object_store_secret",
+    "web_search": "web_search_api_key",
+    "im_channel": "im_webhook",
+}
 
 
-class ComponentRegistry:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self._cache: dict[str, Any] = {}
-        self._state_path: Path = settings.data_dir / "components.json"
-        self._overrides: dict[str, str] = self._load_overrides()
+def _component_key(name: str) -> str:
+    """接受 ``llm`` 或 ``llm_provider``，统一成配置项名。"""
+    if name in COMPONENT_TO_CATALOG:
+        return name
+    for component, catalog_key in COMPONENT_TO_CATALOG.items():
+        if catalog_key == name:
+            return component
+    raise ValueError(f"未知组件类别：{name}")
 
-    # -------------------------------------------------------------- 状态持久化
-    def _load_overrides(self) -> dict[str, str]:
-        if self._state_path.exists():
-            try:
-                return dict(json.loads(self._state_path.read_text(encoding="utf-8")))
-            except json.JSONDecodeError:
-                return {}
-        return {}
 
-    def _save_overrides(self) -> None:
-        with _STATE_LOCK:
-            self._state_path.write_text(
-                json.dumps(self._overrides, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+# --------------------------------------------------------------------------- #
+# 构建
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class Components:
+    llm: LLMProvider
+    embedding: EmbeddingProvider
+    vector_store: VectorStore
+    object_store: ObjectStore
+    doc_parser: DocParser
+    web_search: WebSearch
+    im: IMChannel
+    reranker: Reranker
+    selections: dict[str, str] = field(default_factory=dict)
 
-    def active_name(self, kind: str) -> str:
-        default = {
-            "llm": self.settings.llm_provider,
-            "embedding": self.settings.embedding_provider,
-            "vector_store": self.settings.vector_store,
-            "object_store": self.settings.object_store,
-            "web_search": self.settings.web_search_provider,
-            "im_channel": self.settings.im_channel,
-            "rerank": self.settings.rerank_provider,
-        }.get(kind, "")
-        return self._overrides.get(kind, default) or default
 
-    def set_active(self, kind: str, name: str) -> None:
-        with _STATE_LOCK:
-            self._overrides[kind] = name
-            self._cache.pop(kind, None)
-            self._save_overrides()
-
-    # ------------------------------------------------------------------ LLM
-    def build_llm(self, name: str | None = None) -> LLMProvider:
-        chosen = name or self.active_name("llm")
-        s = self.settings
-        if chosen in ("mock", "local", "") or not (s.llm_api_key or s.has_remote_llm):
-            return MockLLMProvider()
-        return OpenAICompatProvider(
-            api_key=s.llm_api_key,
-            base_url=s.llm_base_url,
-            model=s.llm_model,
-            temperature=s.llm_temperature,
-            max_tokens=s.llm_max_tokens,
-            timeout=s.llm_timeout_s,
+def _build_llm(settings: Settings) -> LLMProvider:
+    key = settings.llm_provider or "mock"
+    if key.startswith("openai_compat"):
+        vendor = key.split(":", 1)[1] if ":" in key else "dashscope"
+        return OpenAICompatLLM(
+            vendor=vendor,
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
         )
+    return MockLLM()
 
-    def llm(self) -> LLMProvider:
-        return self._cached("llm", self.build_llm)
 
-    # ------------------------------------------------------------ Embedding
-    def build_embedding(self, name: str | None = None) -> EmbeddingProvider:
-        chosen = name or self.active_name("embedding")
-        s = self.settings
-        if chosen == "openai_compat" and s.embedding_api_key:
-            return OpenAICompatEmbedder(
-                api_key=s.embedding_api_key,
-                base_url=s.embedding_base_url or s.llm_base_url,
-                model=s.embedding_model,
-                dim=s.embedding_dim,
-            )
-        return LocalHashEmbedder(dim=s.embedding_dim)
+def _build_embedding(settings: Settings) -> EmbeddingProvider:
+    key = settings.embedding_provider or "local_hash"
+    if key.startswith("openai_compat"):
+        return OpenAICompatEmbedding(
+            base_url=settings.embedding_base_url,
+            api_key=settings.embedding_api_key,
+            model=settings.embedding_model or "text-embedding-3-small",
+            dim=settings.embedding_dim,
+        )
+    return LocalHashEmbedding(dim=settings.embedding_dim)
 
-    def embedding(self) -> EmbeddingProvider:
-        return self._cached("embedding", self.build_embedding)
 
-    # ------------------------------------------------------------- VectorStore
-    def build_vector_store(self, name: str | None = None) -> VectorStore:
-        chosen = name or self.active_name("vector_store")
-        s = self.settings
-        if chosen == "pgvector":
-            return PgVectorStore(s.database_url or "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/finonto")
-        if chosen == "dashvector":
-            return DashVectorStore(
-                api_key=s.llm_api_key,
-                endpoint=s.web_search_endpoint,
-                collection="finonto_chunks",
-                dim=s.embedding_dim,
-            )
-        if chosen == "memory":
-            return InMemoryVectorStore()
-        return SqliteNumpyVectorStore(f"sqlite:///{(s.data_dir / 'vectors.db').as_posix()}")
+def _build_vector_store(settings: Settings, dim: int) -> VectorStore:
+    key = settings.vector_store or "sqlite_numpy"
+    if key == "memory":
+        return MemoryVectorStore(dim=dim)
+    if key == "pgvector":
+        return PgVectorStore(settings.resolved_database_url(), dim=dim)
+    store = SqliteNumpyVectorStore(dim=dim)
+    store.model = settings.embedding_provider or "local_hash"  # type: ignore[attr-defined]
+    return store
 
-    def vector_store(self) -> VectorStore:
-        return self._cached("vector_store", self.build_vector_store)
 
-    # ------------------------------------------------------------ ObjectStore
-    def build_object_store(self, name: str | None = None) -> ObjectStore:
-        chosen = name or self.active_name("object_store")
-        s = self.settings
-        if chosen == "oss" and s.oss_bucket:
-            return OSSObjectStore(
-                bucket=s.oss_bucket,
-                endpoint=s.oss_endpoint,
-                access_key_id=s.oss_access_key_id,
-                access_key_secret=s.oss_access_key_secret,
-            )
-        return LocalFSObjectStore(s.object_store_root)
+def _build_object_store(settings: Settings) -> ObjectStore:
+    key = settings.object_store or "local_fs"
+    if key == "s3":
+        from .objectstore import S3CompatibleObjectStore
 
-    def object_store(self) -> ObjectStore:
-        return self._cached("object_store", self.build_object_store)
+        return S3CompatibleObjectStore(
+            bucket=settings.object_store_bucket,
+            endpoint=settings.object_store_endpoint,
+            access_key=settings.object_store_key,
+            secret_key=settings.object_store_secret,
+        )
+    return LocalFSObjectStore(settings.objects_dir)
 
-    # -------------------------------------------------------------- DocParser
-    def doc_parser(self, _fmt: str | None = None) -> DocParser:
-        return self._cached("doc_parser", DefaultDocParser)
 
-    # ------------------------------------------------------------- DataSource
-    def data_source(self, uri: str) -> DataSource:
-        if uri.startswith(("file://", "local://", "/")) or uri[1:3] == ":\\" or "\\" in uri:
-            return FileDataSource()
-        if uri.startswith("sqlite"):
-            return SQLiteDataSource()
-        if uri.startswith(("http://", "https://")):
-            return HttpJsonDataSource()
-        return JdbcDataSource()
-
-    # -------------------------------------------------------------- WebSearch
-    def build_web_search(self, name: str | None = None) -> WebSearch:
-        chosen = name or self.active_name("web_search")
-        s = self.settings
-        if chosen == "duckduckgo":
+def _build_web_search(settings: Settings) -> WebSearch:
+    key = settings.web_search or "none"
+    match key:
+        case "duckduckgo":
             return DuckDuckGoSearch()
-        if chosen in ("tavily", "bocha", "serper") and s.web_search_api_key:
-            endpoint = s.web_search_endpoint or {
-                "tavily": "https://api.tavily.com/search",
-                "bocha": "https://api.bochaai.com/v1/web-search",
-                "serper": "https://google.serper.dev/search",
-            }[chosen]
-            return ApiKeyWebSearch(chosen, endpoint, s.web_search_api_key, shape=chosen)
-        return NoopWebSearch()
+        case "tavily":
+            return TavilySearch(settings.web_search_api_key)
+        case "bocha":
+            return BochaSearch(settings.web_search_api_key)
+        case "serper":
+            return SerperSearch(settings.web_search_api_key)
+        case _:
+            return NoWebSearch()
 
-    def web_search(self) -> WebSearch:
-        return self._cached("web_search", self.build_web_search)
 
-    # ---------------------------------------------------------------- IM
-    def build_im(self, name: str | None = None) -> IMChannel:
-        chosen = name or self.active_name("im_channel")
-        s = self.settings
-        table = {"dingtalk": DingTalkChannel, "feishu": FeishuChannel, "wecom": WeComChannel, "slack": SlackChannel}
-        if chosen in table and s.im_webhook_url:
-            return table[chosen](s.im_webhook_url, s.im_secret)
-        return ConsoleChannel()
+def _build_im(settings: Settings) -> IMChannel:
+    key = settings.im_channel or "none"
+    factory = IM_IMPLEMENTATIONS.get(key)
+    if factory is None or key == "none":
+        return LogOnlyIM()
+    return factory(settings.im_webhook)
 
-    def im(self) -> IMChannel:
-        return self._cached("im_channel", self.build_im)
 
-    # ---------------------------------------------------------------- misc
-    def _cached(self, key: str, factory):  # noqa: ANN001
-        with _STATE_LOCK:
-            if key not in self._cache or self._cache.get(f"{key}:name") != self.active_name(key):
-                self._cache[key] = factory()
-                self._cache[f"{key}:name"] = self.active_name(key)
-            return self._cache[key]
+def _build_reranker(settings: Settings, llm: LLMProvider) -> Reranker:
+    key = settings.rerank_provider or "heuristic"
+    if key == "llm":
+        return LLMReranker(llm)
+    if key == "cross_encoder":
+        return CrossEncoderReranker()
+    return HeuristicReranker()
 
-    # ------------------------------------------------------------- 组件描述
-    def describe(self) -> list[ProviderInfo]:
-        s = self.settings
-        out: list[ProviderInfo] = []
 
-        out.append(
-            ProviderInfo(
-                kind="llm",
-                name=self.active_name("llm"),
-                display="抽取式本地基线（零依赖）",
-                description="按任务分派的确定性推理实现，未配置密钥时的默认选项，可完整跑通问答/本体/Agent 链路。",
-                configured=True,
-                local_fallback=True,
-                module="providers.llm.mock",
-                capabilities=["chat", "json", "stream", "react"],
-            )
+def build_components(settings: Settings | None = None) -> Components:
+    settings = settings or get_settings()
+    llm = _build_llm(settings)
+    embedding = _build_embedding(settings)
+    vector_store = _build_vector_store(settings, embedding.dim)
+    return Components(
+        llm=llm,
+        embedding=embedding,
+        vector_store=vector_store,
+        object_store=_build_object_store(settings),
+        doc_parser=DefaultMultiFormatParser(),
+        web_search=_build_web_search(settings),
+        im=_build_im(settings),
+        reranker=_build_reranker(settings, llm),
+        selections={key: getattr(settings, key) for key in COMPONENT_KEYS},
+    )
+
+
+@lru_cache(maxsize=1)
+def _cached_components(_stamp: int = 0) -> Components:
+    return build_components()
+
+
+def get_components() -> Components:
+    return _cached_components()
+
+
+def reset_components() -> None:
+    _cached_components.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
+# 目录 / 切换 / 探针
+# --------------------------------------------------------------------------- #
+def catalog(settings: Settings | None = None) -> list[dict[str, Any]]:
+    settings = settings or get_settings()
+    active = {key: getattr(settings, key) for key in COMPONENT_KEYS}
+    flags = settings.secret_flags()
+    categories: list[dict[str, Any]] = []
+    for component_key in COMPONENT_KEYS:
+        catalog_key = COMPONENT_TO_CATALOG[component_key]
+        secret_field = SECRET_BY_COMPONENT.get(component_key)
+        entries = []
+        for entry in CATALOG[catalog_key]:
+            item = dict(entry)
+            item["active"] = entry["key"] == active.get(component_key)
+            if entry["needs_key"] and secret_field:
+                item["key_configured"] = flags.get(secret_field, False)
+            entries.append(item)
+        categories.append(
+            {
+                "key": component_key,
+                "catalog_key": catalog_key,
+                "label": CATEGORY_LABELS[catalog_key],
+                "active": active.get(component_key, ""),
+                "entries": entries,
+            }
         )
-        for vendor in LLM_VENDORS:
-            out.append(
-                ProviderInfo(
-                    kind="llm",
-                    name=f"openai_compat:{vendor['key']}",
-                    display=vendor["display"],
-                    description=f"OpenAI 兼容 Chat Completions；base_url={vendor['base_url']}，默认 model={vendor['model']}。",
-                    configured=(s.llm_provider != "mock" and s.llm_base_url.startswith(vendor["base_url"])),
-                    config_hint={"FINONTO_LLM_BASE_URL": vendor["base_url"], "FINONTO_LLM_MODEL": vendor["model"], "FINONTO_LLM_API_KEY": "<密钥>"},
-                    capabilities=["chat", "json", "stream"],
-                    module="providers.llm.openai_compat",
-                )
-            )
-
-        out.append(
-            ProviderInfo(
-                kind="embedding",
-                name="local_hash",
-                display="本地特征哈希 Embedding",
-                description=f"带符号 n-gram 特征哈希 + 次线性 TF 加权，dim={s.embedding_dim}，确定性、可离线。",
-                configured=self.active_name("embedding") == "local_hash",
-                local_fallback=True,
-                capabilities=["embed"],
-                module="providers.embedding.local_hash",
-            )
-        )
-        out.append(
-            ProviderInfo(
-                kind="embedding",
-                name="openai_compat",
-                display="OpenAI 兼容 Embeddings",
-                description="支持 DashScope text-embedding-v3 / OpenAI text-embedding-3-small 等。",
-                configured=bool(s.embedding_api_key),
-                config_hint={"FINONTO_EMBEDDING_PROVIDER": "openai_compat", "FINONTO_EMBEDDING_API_KEY": "<密钥>", "FINONTO_EMBEDDING_MODEL": "text-embedding-v3"},
-                capabilities=["embed"],
-                module="providers.embedding.openai_compat",
-            )
-        )
-
-        for name, display, desc, mods in (
-            ("sqlite_numpy", "SQLite + numpy 向量库（默认）", "自带命名空间表，与业务表解耦；万级 chunk 全内存 cosine 检索。", True),
-            ("pgvector", "PostgreSQL + pgvector", "生产级向量检索，需安装 pgvector 扩展并提供 database_url。", False),
-            ("dashvector", "阿里云 DashVector", "托管向量库，需 dashvector 客户端与 API Key。", False),
-            ("memory", "进程内向量库", "会话级临时检索，重启丢失，用于测试。", True),
-        ):
-            out.append(
-                ProviderInfo(
-                    kind="vector_store",
-                    name=name,
-                    display=display,
-                    description=desc,
-                    configured=self.active_name("vector_store") == name,
-                    local_fallback=mods,
-                    capabilities=["upsert", "search", "delete"],
-                    module="providers.vectorstore",
-                )
-            )
-
-        for name, display, desc, local in (
-            ("local_fs", "本地文件系统对象存储（默认）", "写入 var/objects，键名做穿越防护。", True),
-            ("oss", "阿里云 OSS / S3 兼容", "需 oss2 与 bucket 配置，用于生产环境原始文件留存。", False),
-        ):
-            out.append(
-                ProviderInfo(
-                    kind="object_store",
-                    name=name,
-                    display=display,
-                    description=desc,
-                    configured=self.active_name("object_store") == name,
-                    local_fallback=local,
-                    capabilities=["put", "get", "delete"],
-                    module="providers.objectstore",
-                )
-            )
-
-        parser = DefaultDocParser()
-        out.append(
-            ProviderInfo(
-                kind="doc_parser",
-                name=parser.name,
-                display="多格式文档解析器",
-                description="支持 " + "、".join(sorted(set(parser.formats))) + "；PDF/DOCX/XLSX 使用可选依赖，缺失时优雅降级为纯文本。",
-                configured=True,
-                capabilities=list(parser.formats),
-                module="providers.docparser.parsers",
-            )
-        )
-
-        for name, display, desc, hint in (
-            ("file", "本地文件表数据源", "CSV / TSV / Excel / JSON 直接表格化，可反推对象类型属性。", "uri=local://data/products.csv"),
-            ("sqlite", "SQLite 库表数据源", "读取行内库表结构与样本行。", "uri=sqlite:///D:/dw/mart.db"),
-            ("http_json", "HTTP JSON 数据源", "GET 返回对象数组即可表格化，适合内部元数据服务。", "uri=https://meta.internal/tables"),
-            ("jdbc", "JDBC 风格企业库", "提供 SQLAlchemy URL 即可接 MySQL/Oracle/PG 数仓。", "uri=mysql+pymysql://user:pw@host:3306/dw"),
-        ):
-            out.append(
-                ProviderInfo(
-                    kind="data_source",
-                    name=name,
-                    display=display,
-                    description=desc,
-                    configured=True,
-                    local_fallback=name in ("file", "sqlite"),
-                    config_hint={"example_uri": hint},
-                    capabilities=["describe", "sample", "profile"],
-                    module="providers.datasource.connectors",
-                )
-            )
-
-        for name, display, desc, configured in (
-            ("none", "不接入 IM", "所有通知只落本地 outbox。", True),
-            ("dingtalk", "钉钉群机器人", "支持加签 webhook。", self.active_name("im_channel") == "dingtalk"),
-            ("feishu", "飞书自定义机器人", "支持文本与卡片。", self.active_name("im_channel") == "feishu"),
-            ("wecom", "企业微信群机器人", "markdown 消息。", self.active_name("im_channel") == "wecom"),
-            ("slack", "Slack Incoming Webhook", "境外团队协作。", self.active_name("im_channel") == "slack"),
-        ):
-            out.append(
-                ProviderInfo(
-                    kind="im_channel",
-                    name=name,
-                    display=display,
-                    description=desc,
-                    configured=configured,
-                    local_fallback=name == "none",
-                    config_hint={"FINONTO_IM_CHANNEL": name, "FINONTO_IM_WEBHOOK_URL": "<webhook>", "FINONTO_IM_SECRET": "<加签密钥, 可选>"},
-                    capabilities=["send"],
-                    module="providers.im.channels",
-                )
-            )
-
-        for name, display, desc, configured in (
-            ("none", "关闭网络搜索", "Agent 的 search.web 返回空并说明原因。", True),
-            ("duckduckgo", "DuckDuckGo（无需密钥）", "抓取 HTML 结果，适合外网可达环境。", self.active_name("web_search") == "duckduckgo"),
-            ("tavily", "Tavily", "面向 LLM Agent 的搜索 API。", False),
-            ("bocha", "博查 AI 搜索", "中文语料友好。", False),
-            ("serper", "Serper (Google)", "低延迟 SERP。", False),
-        ):
-            out.append(
-                ProviderInfo(
-                    kind="web_search",
-                    name=name,
-                    display=display,
-                    description=desc,
-                    configured=configured,
-                    local_fallback=name == "none",
-                    config_hint={"FINONTO_WEB_SEARCH_PROVIDER": name, "FINONTO_WEB_SEARCH_API_KEY": "<密钥, 可选>"},
-                    capabilities=["search", "fetch"],
-                    module="providers.search.web",
-                )
-            )
-
-        for name, display, desc in (
-            ("heuristic", "启发式重排序（默认）", "词覆盖 / 短语精确命中 / 权威度 / 新近度 / 位置加权融合，零外部调用。"),
-            ("llm", "LLM pointwise 重排序", "调用当前 LLM 对候选片段逐条打分并给理由。"),
-            ("cross_encoder", "Cross-Encoder 重排序", "需部署 bge-reranker 之类的服务并配置 endpoint。"),
-        ):
-            out.append(
-                ProviderInfo(
-                    kind="rerank",
-                    name=name,
-                    display=display,
-                    description=desc,
-                    configured=self.active_name("rerank") == name,
-                    local_fallback=name == "heuristic",
-                    capabilities=["rerank"],
-                    module="core.rag.reranker",
-                )
-            )
-
-        for target in DEPLOY_TARGETS:
-            out.append(
-                ProviderInfo(
-                    kind="deploy",
-                    name=target["key"],
-                    display=target["display"],
-                    description=f"{target.get('description', '')} {target['hint']}".strip(),
-                    configured=target["key"] == "local",
-                    config_hint={"how": target["hint"]},
-                    module="deployment",
-                )
-            )
-        return out
-
-    def health(self) -> dict[str, Any]:
-        llm = self.llm()
-        emb = self.embedding()
-        vs = self.vector_store()
-        return {
-            "llm": {"active": self.active_name("llm"), "class": type(llm).__name__, "mock": isinstance(llm, MockLLMProvider)},
-            "embedding": {"active": self.active_name("embedding"), "dim": emb.dim, "class": type(emb).__name__},
-            "vector_store": {"active": self.active_name("vector_store"), "class": type(vs).__name__},
-            "object_store": {"active": self.active_name("object_store")},
-            "web_search": {"active": self.active_name("web_search")},
-            "im_channel": {"active": self.active_name("im_channel")},
-            "rerank": {"active": self.active_name("rerank")},
-        }
+    return categories
 
 
-registry = ComponentRegistry(get_settings())
+def activate(category: str, key: str) -> dict[str, Any]:
+    """把某个类别的实现写入 ``var/components.json``（重启后仍生效）。"""
+    component_key = _component_key(category)
+    catalog_key = COMPONENT_TO_CATALOG[component_key]
+    valid = {entry["key"] for entry in CATALOG[catalog_key]}
+    if key not in valid:
+        raise ValueError(f"{catalog_key} 不支持实现：{key}")
+    settings = get_settings()
+    path = settings.components_path
+    current: dict[str, str] = {}
+    if path.is_file():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            current = {}
+    current[component_key] = key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"category": component_key, "key": key, "path": str(path), "restart_required": True}
 
 
-def get_registry() -> ComponentRegistry:
-    return registry
-
-
-async def probe_llm(reg: ComponentRegistry | None = None) -> dict[str, Any]:
-    """连通性探针：给组件设置页一个「测试连接」按钮的真实依据。"""
-    reg = reg or registry
-    provider = reg.build_llm()
-    messages = [ChatMessage(role="user", content="[[TASK:generic]]\n只回复两个字：可用")]
+def probe(category: str, key: str) -> dict[str, Any]:
+    """连通性探针：永远返回结构化结果，不抛错。"""
+    component_key = _component_key(category)
+    category = COMPONENT_TO_CATALOG[component_key]
+    settings = get_settings()
     try:
-        text, usage = await provider.complete(messages, task="generic", max_tokens=16)
-        return {"ok": True, "provider": type(provider).__name__, "echo": text[:40], "usage": usage.total}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "provider": type(provider).__name__, "error": str(exc)[:300]}
+        if category == "llm":
+            provider = build_components(settings).llm
+            text = provider.chat([Message(role="user", content="ping")], max_tokens=8)
+            return {"ok": True, "detail": f"返回 {len(text)} 字符", "provider": provider.info()}
+        if category == "embedding":
+            provider = build_components(settings).embedding
+            vector = provider.embed_one("设备维保")
+            return {"ok": True, "detail": f"维度 {len(vector)}", "provider": provider.info()}
+        if category == "vector_store":
+            store = build_components(settings).vector_store
+            return {"ok": True, "detail": str(store.stats()), "provider": store.info()}
+        if category == "object_store":
+            store = build_components(settings).object_store
+            probe_key = "_probe/health.txt"
+            store.put(probe_key, b"ok", "text/plain")
+            ok = store.get(probe_key) == b"ok"
+            store.delete(probe_key)
+            return {"ok": ok, "detail": "写入/读取/删除均成功" if ok else "读写不一致", "provider": store.info()}
+        if category == "doc_parser":
+            parser = build_components(settings).doc_parser
+            parsed = parser.parse("probe.txt", "组件探针自检文本。".encode("utf-8"))
+            return {"ok": bool(parsed.text), "detail": f"解析到 {len(parsed.text)} 字符", "provider": parser.info()}
+        if category == "data_source":
+            from .datasource import route
+
+            source = route("local://probe.txt")
+            return {"ok": True, "detail": source.info(), "provider": source.info()}
+        if category == "web_search":
+            search = build_components(settings).web_search
+            results = search.search("FinOnto 本体", top_k=2)
+            return {
+                "ok": True if results or search.name == "none" else False,
+                "detail": f"{len(results)} 条结果" if results else "实现已加载（无结果或已关闭）",
+                "provider": search.info(),
+            }
+        if category == "im_channel":
+            channel = build_components(settings).im
+            ok = channel.send("组件探针：IM 通道连通性测试", title="FinOnto")
+            return {"ok": ok, "detail": "已发送" if ok else "发送失败或未配置", "provider": channel.info()}
+        if category == "rerank":
+            reranker = build_components(settings).reranker
+            return {"ok": True, "detail": "实现已加载", "provider": reranker.info()}
+        if category == "deploy_target":
+            return {"ok": True, "detail": f"当前目标：{key}", "provider": {"name": key}}
+        return {"ok": False, "detail": f"未知类别：{category}"}
+    except Exception as exc:  # noqa: BLE001 - 探针用于展示，不抛错
+        return {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+
+
+__all__ = [
+    "CATALOG",
+    "CATEGORY_LABELS",
+    "Components",
+    "build_components",
+    "catalog",
+    "activate",
+    "probe",
+    "get_components",
+    "reset_components",
+]

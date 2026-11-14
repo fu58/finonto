@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>登录 · FinOnto</title>
+  <link rel="stylesheet" href="/static/css/app.css"/>
+</head>
+<body class="login-page">
+<main class="login-card">
+  <header>
+    <strong class="login-brand">FinOnto</strong>
+    <p class="muted small">多领域本体生成平台 · 请登录后使用</p>
+  </header>
+
+  {% if error %}
+  <div class="banner err">{{ error }}</div>
+  {% endif %}
+
+  <form method="post" action="/login" class="stack">
+    <input type="hidden" name="next" value="{{ next_url or '/' }}"/>
+    <label>用户名
+      <input name="username" value="{{ username or '' }}" autocomplete="username" required autofocus/>
+    </label>
+    <label>密码
+      <input name="password" type="password" autocomplete="current-password" required/>
+    </label>
+    <button class="btn primary" type="submit">登录</button>
+  </form>
+
+  {% if bootstrap_hint %}
+  <div class="banner info small">
+    首次使用：内置管理员 <code>{{ bootstrap_hint.username }}</code> /
+    <code>{{ bootstrap_hint.password }}</code>（登录后请立即修改）。
+    {% if not bootstrap_hint.default_password %}
+    初始密码来自 <code>FINONTO_ADMIN_PASSWORD</code>。
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <footer class="login-foot">
+    <span>request-id：{{ request_id or '-' }}</span>
+    <a href="/api/health" target="_blank">健康检查</a>
+  </footer>
+</main>
+</body>
+</html>

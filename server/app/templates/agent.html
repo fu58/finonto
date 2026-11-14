@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block title %}Agent 推理{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>Agent 推理</h1>
+    <p class="muted">
+      ReAct 循环：Thought → Action → Observation。写本体只能通过
+      <code>propose_type</code> 产出提案；步数与 token 预算可配，重复调用会被判为无进展。
+    </p>
+  </header>
+
+  <form id="agent-form" class="ask-form" data-stream="/api/agent/stream">
+    <div class="form-grid">
+      <label>技能
+        <select name="skill">
+          {% for skill in skills %}
+          <option value="{{ skill.key }}" {% if loop.first %}selected{% endif %}>{{ skill.display }} · {{ skill.description }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>最大步数
+        <input type="number" name="max_steps" value="8" min="1" max="20"/>
+      </label>
+    </div>
+    <textarea name="goal" rows="2" required placeholder="例如：为当前空间补充「贷后检查计划」相关对象类型"></textarea>
+    <div class="ask-actions">
+      <button type="submit" class="btn primary">开始推理</button>
+      <span id="agent-status" class="muted small"></span>
+    </div>
+  </form>
+</section>
+
+<section class="panel" id="steps-panel" hidden>
+  <header class="panel-head">
+    <h2>推理步骤</h2>
+    <span id="agent-meta" class="muted small"></span>
+  </header>
+  <ol id="agent-steps" class="steps"></ol>
+</section>
+
+<section class="panel" id="agent-result" hidden>
+  <header class="panel-head"><h2>结论</h2></header>
+  <pre id="agent-conclusion" class="code-block"></pre>
+  <div id="agent-proposals" class="list"></div>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>运行记录</h2></header>
+  <div class="list">
+    {% for run in runs %}
+    <div class="row">
+      <div class="row-main">
+        <strong>#{{ run.id }} {{ run.skill }}</strong>
+        <span class="muted small">{{ run.goal|shorten(70) }}</span>
+      </div>
+      <div class="row-meta">
+        <span class="badge {{ 'ok' if run.status == 'succeeded' else 'warn' if run.status == 'running' else 'err' }}">{{ run.status }}</span>
+        <span class="muted small">{{ run.steps }} 步 · {{ run.tokens }} tokens</span>
+        {% if run.proposals %}<a class="badge info" href="/proposals?space={{ space_id }}">{{ run.proposals|length }} 提案</a>{% endif %}
+      </div>
+    </div>
+    {% else %}
+    <p class="muted">还没有运行记录。</p>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <h2>沙箱与记忆</h2>
+    <span class="muted small">沙箱只允许白名单标准库；记忆支持时间衰减与清理</span>
+  </header>
+  <div class="two-col">
+    <div>
+      <h3>代码沙箱</h3>
+      <textarea id="sandbox-code" rows="6" class="mono">import json
+rows = [{"key": "a", "v": 2}, {"key": "b", "v": 3}]
+print(json.dumps(rows, ensure_ascii=False))
+print(sorted(r["v"] for r in rows))</textarea>
+      <div class="ask-actions">
+        <button class="btn" data-post="/api/agent/sandbox" data-json="sandbox-code" data-serialize="code">运行</button>
+        <button class="btn" data-post="/api/agent/sandbox/validate" data-json="sandbox-code" data-serialize="code">仅校验</button>
+      </div>
+      <pre id="sandbox-out" class="code-block"></pre>
+    </div>
+    <div>
+      <h3>长期记忆 <span class="muted small">({{ memory_stats.count }} 条 · 平均权重 {{ memory_stats.avg_weight }})</span></h3>
+      <div class="list compact">
+        {% for item in memories %}
+        <div class="row">
+          <div class="row-main"><span class="badge ghost">{{ item.kind }}</span>{{ item.content|shorten(90) }}</div>
+          <div class="row-meta"><span class="muted small">w={{ item.weight }} · hits={{ item.hits }}</span></div>
+        </div>
+        {% else %}
+        <p class="muted">暂无记忆；Agent 成功运行后会自动归纳。</p>
+        {% endfor %}
+      </div>
+      <div class="ask-actions">
+        <button class="btn" data-post="/api/agent/memory/decay?space={{ space_id }}">时间衰减</button>
+        <button class="btn" data-post="/api/agent/memory/prune?space={{ space_id }}">清理低权重</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <h2>MCP 服务</h2>
+    <span class="muted small">inproc / stdio / http 三种传输；内置 3 个进程内服务</span>
+  </header>
+  <div class="list compact">
+    {% for server in mcp_servers %}
+    <div class="row">
+      <div class="row-main">
+        <strong>{{ server.name }}</strong>
+        <span class="badge ghost">{{ server.transport }}</span>
+        <span class="muted small">{{ server.description }}</span>
+      </div>
+      <div class="row-meta">
+        <span class="muted small">{{ server.tools|join(' · ') }}</span>
+        <span class="badge {{ 'ok' if server.enabled else 'err' }}">{{ '启用' if server.enabled else '停用' }}</span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/stream.js"></script>
+<script>
+document.addEventListener("click", async (event) => {
+  const btn = event.target.closest("[data-post][data-json]");
+  if (!btn) return;
+  event.preventDefault();
+  const source = document.getElementById(btn.dataset.json);
+  const payload = {};
+  payload[btn.dataset.serialize || "code"] = source ? source.value : "";
+  const res = await fetch(btn.dataset.post, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  const out = document.getElementById("sandbox-out");
+  out.textContent = JSON.stringify(data, null, 2);
+});
+</script>
+{% endblock %}

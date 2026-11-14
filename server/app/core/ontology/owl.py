@@ -1,341 +1,296 @@
-"""本体导出：OWL Turtle / SHACL 形状 / SKOS 词表 / JSON Schema。
+"""本体导出：Turtle（OWL + SHACL）、SKOS 词表、逐类型 JSON Schema。
 
-导出面向既有语义网与数据集成两条路径：前者可载入 Protégé / Apache Jena，
-后者可直接给数据中台做表结构对齐。
+导出不是「顺便做一下」：企业里本体要能被下游系统消费（数据治理平台、图数据库、
+表单引擎），所以三种格式各解决一个问题——
+* Turtle/OWL：类与属性的形式化语义，可导入 GraphDB/Neo4j(neosemantics)；
+* SHACL：可执行的约束，能做数据质量校验；
+* JSON Schema：前端表单与 API 校验直接可用。
 """
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from ...models import (
-    Constraint,
-    DataPropertyDef,
-    Enumeration,
-    ObjectType,
-    RelationType,
-    Space,
-    TypeDataProperty,
-    TypeLink,
-)
-from .kinds import datatype_iri
+from ...models import Constraint, DataPropertyDef, ObjectType, OntologySpace, RelationType, TypeDataProperty, TypeLink
+from ..text import slugify
 
-PREFIXES = {
-    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
-    "owl": "http://www.w3.org/2002/07/owl#",
-    "xsd": "http://www.w3.org/2001/XMLSchema#",
-    "skos": "http://www.w3.org/2004/02/skos/core#",
-    "sh": "http://www.w3.org/ns/shacl#",
-    "dcterms": "http://purl.org/dc/terms/",
-    "onto": "https://finonto.example.com/vocab/",
+XSD_MAP = {
+    "string": "xsd:string",
+    "integer": "xsd:integer",
+    "decimal": "xsd:decimal",
+    "boolean": "xsd:boolean",
+    "date": "xsd:date",
+    "datetime": "xsd:dateTime",
+    "uri": "xsd:anyURI",
+    "enum": "xsd:string",
 }
 
-
-def _q(value: str, lang: str = "zh") -> str:
-    text = (value or "").replace("\\", "\\\\").replace('"', '\\"')
-    text = re.sub(r"\s+", " ", text).strip()
-    return f'"{text}"@{lang}' if lang else f'"{text}"'
-
-
-def _plain(value: str) -> str:
-    return re.sub(r"\s+", " ", (value or "").replace('"', "'")).strip()
-
-
-def _prefix_lines(space: Space) -> list[str]:
-    lines = [f"@prefix {p}: <{u}> ." for p, u in PREFIXES.items()]
-    lines.append(f"@prefix : <{space.iri}> .")
-    return lines
-
-
-def _subject(subject: str, triples: list[str]) -> list[str]:
-    body = " ;\n    ".join(t for t in triples if t)
-    return [f"{subject} {body} .", ""]
-
-
-def to_turtle(session: Session, space_id: int, type_ids: list[int] | None = None) -> str:
-    space = session.get(Space, space_id)
-    if space is None:
-        raise KeyError(f"空间 {space_id} 不存在")
-    base = space.iri
-    stmt = select(ObjectType).where(ObjectType.space_id == space_id)
-    if type_ids:
-        stmt = stmt.where(ObjectType.id.in_(type_ids))
-    types = list(session.scalars(stmt.order_by(ObjectType.id)).all())
-    by_id = {t.id: t for t in types}
-
-    def pname(iri: str) -> str:
-        return ":" + iri[len(base) :] if iri and iri.startswith(base) else f"<{iri or 'onto:unknown'}>"
-
-    out: list[str] = _prefix_lines(space)
-    out += _subject(
-        f"<{base}>",
-        [
-            "a owl:Ontology",
-            f"rdfs:label {_q(space.name)}",
-            f"rdfs:comment {_q(space.description)}",
-            f"dcterms:subject {_q(space.domain)}",
-            'owl:versionInfo "0.1"',
-        ],
-    )
-
-    for t in types:
-        triples = [
-            "a owl:Class" + (" , owl:AbstractClass" if t.abstract else ""),
-            f"rdfs:label {_q(t.label)}",
-        ]
-        if t.label_en:
-            triples.append(f'rdfs:label "{_plain(t.label_en)}"@en')
-        if t.plural_label:
-            triples.append(f"skos:altLabel {_q(t.plural_label)}")
-        triples += [f"skos:altLabel {_q(str(a))}" for a in (t.aliases or [])[:8]]
-        if t.definition:
-            triples.append(f"rdfs:comment {_q(t.definition)}")
-        if t.parent_id and t.parent_id in by_id:
-            triples.append(f"rdfs:subClassOf {pname(by_id[t.parent_id].iri)}")
-        triples.append(f"onto:objectKind onto:{t.kind}")
-        triples.append(f"onto:businessDomain {_q(t.business_domain or '通用')}")
-        ann = t.annotations or {}
-        for key in ("data_classification", "risk_dimension", "reg_refs", "identifier_scheme", "lifecycle"):
-            if key in ann:
-                value = ann[key]
-                rendered = json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else str(value)
-                triples.append(f"onto:{key} {_q(rendered, '')}")
-        triples += [f"dcterms:subject {_q(str(tag))}" for tag in (t.tags or [])[:6]]
-        triples.append(f"onto:status {_q(t.status, '')}")
-        triples.append(f'onto:confidence "{round(float(t.confidence or 0), 3)}"')
-        triples.append(f"onto:origin {_q(t.origin, '')}")
-        out += _subject(pname(t.iri), triples)
-
-    props = list(session.scalars(select(DataPropertyDef).where(DataPropertyDef.space_id == space_id)).all())
-    for p in props:
-        triples = [
-            "a owl:DatatypeProperty",
-            f"rdfs:label {_q(p.label)}",
-            f"rdfs:comment {_q(p.description)}" if p.description else "",
-            f"rdfs:range {datatype_iri(p.datatype)}",
-            f"onto:unit {_q(p.unit, '')}" if p.unit else "",
-            f"onto:pattern {_q(p.pattern, '')}" if p.pattern else "",
-            f"onto:formatRef {_q(p.format_ref, '')}" if p.format_ref else "",
-        ]
-        out += _subject(pname(p.iri), triples)
-
-    slots = list(
-        session.scalars(
-            select(TypeDataProperty).join(ObjectType, ObjectType.id == TypeDataProperty.object_type_id).where(
-                ObjectType.space_id == space_id
-            )
-        ).all()
-    )
-    for slot in slots:
-        definition = session.get(DataPropertyDef, slot.property_id)
-        owner = session.get(ObjectType, slot.object_type_id)
-        if not definition or not owner:
-            continue
-        card = "minCardinality" if (slot.required or slot.min_card) else "maxCardinality"
-        value = slot.min_card if (slot.required or slot.min_card) else slot.max_card
-        restriction = f"[ a owl:Restriction ; owl:onProperty {pname(definition.iri)} ; owl:{card} {value} ]"
-        out += _subject(pname(owner.iri), [f"rdfs:subClassOf {restriction}"])
-
-    rels = list(session.scalars(select(RelationType).where(RelationType.space_id == space_id)).all())
-    for r in rels:
-        triples = [
-            "a owl:ObjectProperty"
-            + (", owl:SymmetricProperty" if r.symmetric else "")
-            + (", owl:TransitiveProperty" if r.transitive else "")
-            + (", owl:FunctionalProperty" if r.functional else ""),
-            f"rdfs:label {_q(r.label)}",
-            f"rdfs:comment {_q(r.description)}" if r.description else "",
-            f"owl:inverseOf onto:{r.inverse_iri}" if r.inverse_iri else "",
-            f"onto:relationCategory onto:{r.category}",
-        ]
-        out += _subject(pname(r.iri), triples)
-
-    for link in session.scalars(select(TypeLink).where(TypeLink.space_id == space_id)).all():
-        if link.source_id not in by_id or link.target_id not in by_id:
-            continue
-        rel = session.get(RelationType, link.relation_id)
-        predicate = pname(rel.iri) if rel else "onto:associatedWith"
-        line = f"{pname(by_id[link.source_id].iri)} {predicate} {pname(by_id[link.target_id].iri)} ."
-        if link.description:
-            line += f"  # {_plain(link.description)}"
-        out.append(line)
-    out.append("")
-
-    for c in session.scalars(select(Constraint).where(Constraint.space_id == space_id)).all():
-        subject = session.get(ObjectType, c.subject_type_id) if c.subject_type_id else None
-        component = {
-            "required": "sh:MinCountConstraintComponent",
-            "cardinality": "sh:MaxCountConstraintComponent",
-            "range": "sh:IntervalConstraintComponent",
-            "pattern": "sh:PatternConstraintComponent",
-            "enum": "sh:InConstraintComponent",
-            "unique": "sh:UniqueValueConstraintComponent",
-            "codependency": "sh:ExpressionConstraintComponent",
-            "consistency": "sh:ExpressionConstraintComponent",
-            "regulatory": "onto:RegulatoryConstraintComponent",
-        }.get(c.kind, "sh:ConstraintComponent")
-        severity = {"violation": "sh:Violation", "warning": "sh:Warning", "info": "sh:Info"}.get(c.severity, "sh:Violation")
-        out += _subject(
-            f":shape/{c.id}",
-            [
-                "a sh:NodeShape",
-                f"sh:targetClass {pname(subject.iri) if subject else 'owl:Thing'}",
-                f"sh:component {component}",
-                f"sh:severity {severity}",
-                f"rdfs:comment {_q(c.expression or c.description)}",
-                f"onto:regRef {_q(c.reg_ref, '')}" if c.reg_ref else "",
-            ],
-        )
-
-    return "\n".join(out)
-
-
-def to_skos(session: Session, space_id: int) -> str:
-    space = session.get(Space, space_id)
-    if space is None:
-        raise KeyError(str(space_id))
-    out = _prefix_lines(space) + ["", f":conceptScheme a skos:ConceptScheme ; rdfs:label {_q(space.name)} .", ""]
-    types = list(session.scalars(select(ObjectType).where(ObjectType.space_id == space_id).order_by(ObjectType.id)))
-    by_id = {t.id: t for t in types}
-    for t in types:
-        out.append(f":concept/{t.id} a skos:Concept ;")
-        out.append(f"    skos:inScheme :conceptScheme ;")
-        out.append(f"    skos:prefLabel {_q(t.label)} ;")
-        if t.label_en:
-            out.append(f'    skos:prefLabel "{_plain(t.label_en)}"@en ;')
-        for alias in (t.aliases or [])[:6]:
-            out.append(f"    skos:altLabel {_q(str(alias))} ;")
-        out.append(f"    skos:definition {_q(t.definition)} ;")
-        if t.parent_id and t.parent_id in by_id:
-            out.append(f"    skos:broader :concept/{by_id[t.parent_id].id} ;")
-        for child in [c for c in types if c.parent_id == t.id]:
-            out.append(f"    skos:narrower :concept/{child.id} ;")
-        out[-1] = out[-1].rstrip(";") + " ."
-        out.append("")
-    return "\n".join(out)
-
-
-_JSON_TYPE = {
+JSON_TYPE_MAP = {
     "string": "string",
-    "text": "string",
-    "identifier": "string",
-    "uri": "string",
     "integer": "integer",
     "decimal": "number",
-    "money": "number",
-    "percentage": "number",
     "boolean": "boolean",
     "date": "string",
     "datetime": "string",
-    "duration": "string",
-    "json": "object",
+    "uri": "string",
     "enum": "string",
 }
 
 
-def to_json_schema(session: Session, space_id: int, type_id: int) -> dict[str, Any]:
-    """对象类型 -> JSON Schema，供数据集成 / 主数据落表使用。"""
-    row = session.get(ObjectType, type_id)
-    if row is None:
-        raise KeyError(str(type_id))
-    slots = session.scalars(select(TypeDataProperty).where(TypeDataProperty.object_type_id == type_id)).all()
-    properties: dict[str, Any] = {}
-    required: list[str] = []
-    for slot in slots:
-        definition = session.get(DataPropertyDef, slot.property_id)
-        if definition is None:
-            continue
-        key = re.sub(r"[^0-9A-Za-z_]", "", definition.iri.rsplit("/", 1)[-1]) or definition.label
-        schema: dict[str, Any] = {
-            "type": _JSON_TYPE.get(definition.datatype, "string"),
-            "title": definition.label,
-            "description": definition.description or slot.description,
-            "x-iri": definition.iri,
-        }
-        if definition.format_ref:
-            schema["format"] = definition.format_ref
-        elif definition.datatype in ("date", "datetime"):
-            schema["format"] = definition.datatype
-        if definition.pattern:
-            schema["pattern"] = definition.pattern
-        if definition.datatype == "enum":
-            enum = session.get(Enumeration, definition.enum_id) if definition.enum_id else None
-            if enum:
-                schema["enum"] = enum.members
-        if slot.unique_flag:
-            schema["x-unique"] = True
-        if slot.key_identifier:
-            schema["x-key"] = True
-        properties[key] = schema
-        if slot.required:
-            required.append(key)
-
-    links = session.scalars(select(TypeLink).where(TypeLink.source_id == type_id)).all()
-    for link in links:
-        rel = session.get(RelationType, link.relation_id)
-        target = session.get(ObjectType, link.target_id)
-        if not rel or not target:
-            continue
-        key = f"rel{re.sub(r'[^0-9A-Za-z]', '', rel.label_en or rel.iri.rsplit('/', 1)[-1]).title()}"
-        properties[key] = {
-            "type": "array" if link.cardinality.startswith("n") else "object",
-            "title": f"{rel.label} -> {target.label}",
-            "description": link.description,
-            "x-target-iri": target.iri,
-            "items": {"type": "string", "format": "uri"} if link.cardinality.startswith("n") else None,
-        }
-        if properties[key]["items"] is None:
-            properties[key].pop("items")
-
-    payload: dict[str, Any] = {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": row.iri,
-        "title": row.label,
-        "description": row.definition,
-        "type": "object",
-        "properties": properties,
-        "x-finonto": {
-            "kind": row.kind,
-            "status": row.status,
-            "businessDomain": row.business_domain,
-            "aliases": row.aliases,
-            "tags": row.tags,
-            "annotations": row.annotations,
-            "confidence": row.confidence,
-        },
-    }
-    if required:
-        payload["required"] = required
-    constraints = session.scalars(
-        select(Constraint).where(Constraint.subject_type_id == type_id)
-    ).all()
-    if constraints:
-        payload["x-constraints"] = [
-            {"name": c.name, "kind": c.kind, "expression": c.expression, "severity": c.severity, "regRef": c.reg_ref}
-            for c in constraints
-        ]
-    return payload
+def _ttl(text: str) -> str:
+    """Turtle 字符串转义（含换行）。"""
+    cleaned = (text or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+    return f'"{cleaned}"@zh'
 
 
-def export_bundle(session: Session, space_id: int) -> dict[str, str]:
-    """一次导出全套序列化产物（文件名 -> 文本内容）。"""
-    space = session.get(Space, space_id)
+def _local(label: str) -> str:
+    """IRI 局部名：ASCII 优先，中文走稳定短码（与 slugify 一致）。"""
+    slug = slugify(label, fallback="Concept")
+    slug = re.sub(r"[^A-Za-z0-9_\-]", "", slug)
+    return slug or "Concept"
+
+
+def export_turtle(session, space_id: int) -> str:
+    space = session.get(OntologySpace, space_id)
     if space is None:
-        raise KeyError(str(space_id))
-    turtle = to_turtle(session, space_id)
-    skos = to_skos(session, space_id)
-    schemas = {
-        str(t.id): json.dumps(to_json_schema(session, space_id, t.id), ensure_ascii=False, indent=2)
-        for t in session.scalars(select(ObjectType).where(ObjectType.space_id == space_id)).all()
-    }
+        return "# 空间不存在\n"
+
+    types = session.execute(
+        select(ObjectType).where(ObjectType.space_id == space_id).order_by(ObjectType.label)
+    ).scalars().all()
+    by_id = {item.id: item for item in types}
+
+    relations = session.execute(
+        select(RelationType).where(RelationType.space_id == space_id)
+    ).scalars().all()
+    relation_by_id = {item.id: item for item in relations}
+
+    props = session.execute(
+        select(DataPropertyDef).where(DataPropertyDef.space_id == space_id)
+    ).scalars().all()
+
+    lines: list[str] = [
+        f"@prefix : <{space.iri}#> .",
+        "@prefix owl: <http://www.w3.org/2002/07/owl#> .",
+        "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .",
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .",
+        "@prefix skos: <http://www.w3.org/2004/02/skos/core#> .",
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .",
+        "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .",
+        "",
+        f"<{space.iri}> a owl:Ontology ;",
+        f"    rdfs:label {_ttl(space.name)} ;",
+        f"    rdfs:comment {_ttl(space.description)} .",
+        "",
+        "# ----------------------------------------------------------------",
+        "# 对象类型（owl:Class）",
+        "# ----------------------------------------------------------------",
+    ]
+
+    for item in types:
+        local = _local(item.label)
+        lines.append(f":{local} a owl:Class ;")
+        lines.append(f"    rdfs:label {_ttl(item.label)} ;")
+        if item.definition:
+            lines.append(f"    rdfs:comment {_ttl(item.definition)} ;")
+        if item.aliases:
+            lines.append(f"    skos:altLabel {', '.join(_ttl(a) for a in item.aliases)} ;")
+        if item.business_domain:
+            lines.append(f"    :businessDomain {_ttl(item.business_domain)} ;")
+        if item.parent_id and item.parent_id in by_id:
+            lines.append(f"    rdfs:subClassOf :{_local(by_id[item.parent_id].label)} ;")
+        lines[-1] = lines[-1].rstrip(" ;") + " ."
+        lines.append("")
+
+    lines.extend(["# ----------------------------------------------------------------", "# 数据属性", "# ----------------------------------------------------------------"])
+    prop_links = session.execute(
+        select(TypeDataProperty.type_id, DataPropertyDef).join(
+            DataPropertyDef, DataPropertyDef.id == TypeDataProperty.property_id
+        )
+    ).all()
+    for prop in props:
+        local = _local(prop.label)
+        lines.append(f":{local} a owl:DatatypeProperty ;")
+        lines.append(f"    rdfs:label {_ttl(prop.label)} ;")
+        lines.append(f"    rdfs:range {XSD_MAP.get(prop.data_type, 'xsd:string')} .")
+        lines.append("")
+
+    for type_id, prop in prop_links:
+        if type_id not in by_id:
+            continue
+        type_local = _local(by_id[type_id].label)
+        prop_local = _local(prop.label)
+        if prop.is_required:
+            lines.append(f":{type_local} rdfs:subClassOf [ a owl:Restriction ;")
+            lines.append(f"    owl:onProperty :{prop_local} ;")
+            lines.append("    owl:minCardinality 1 ] .")
+    lines.append("")
+
+    lines.extend(["# ----------------------------------------------------------------", "# 对象属性（类型间关联）", "# ----------------------------------------------------------------"])
+    links = session.execute(select(TypeLink).where(TypeLink.space_id == space_id)).scalars().all()
+    seen_relations: set[int] = set()
+    for link in links:
+        relation = relation_by_id.get(link.relation_id)
+        if relation is None:
+            continue
+        local = _local(relation.label)
+        if relation.id not in seen_relations:
+            seen_relations.add(relation.id)
+            lines.append(f":{local} a owl:ObjectProperty ;")
+            lines.append(f"    rdfs:label {_ttl(relation.label)} ;")
+            lines.append(f"    :relationCategory {_ttl(relation.category)} .")
+        source = by_id.get(link.source_type_id)
+        target = by_id.get(link.target_type_id)
+        if source and target:
+            lines.append(
+                f":{_local(source.label)} rdfs:subClassOf [ a owl:Restriction ; "
+                f"owl:onProperty :{local} ; owl:allValuesFrom :{_local(target.label)} ] ."
+            )
+    lines.append("")
+
+    lines.extend(["# ----------------------------------------------------------------", "# SHACL 约束", "# ----------------------------------------------------------------"])
+    constraints = session.execute(
+        select(Constraint).where(Constraint.space_id == space_id, Constraint.is_active.is_(True))
+    ).scalars().all()
+    for constraint in constraints:
+        item = by_id.get(constraint.type_id)
+        if item is None:
+            continue
+        shape = f"{_local(item.label)}Shape"
+        severity = {
+            "violation": "sh:Violation",
+            "warning": "sh:Warning",
+            "info": "sh:Info",
+        }.get(constraint.severity, "sh:Violation")
+        lines.append(f":{shape} a sh:NodeShape ;")
+        lines.append(f"    sh:targetClass :{_local(item.label)} ;")
+        lines.append(f"    sh:severity {severity} ;")
+        expression = (constraint.expression or "").replace('"', "'")
+        lines.append(f'    sh:message "{constraint.message or expression}"@zh .')
+        lines.append(f"# 原始表达式：{expression}")
+        if constraint.regulation_ref:
+            lines.append(f'# 依据：{constraint.regulation_ref}')
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def export_skos(session, space_id: int) -> str:
+    space = session.get(OntologySpace, space_id)
+    if space is None:
+        return "# 空间不存在\n"
+    types = session.execute(
+        select(ObjectType).where(ObjectType.space_id == space_id).order_by(ObjectType.label)
+    ).scalars().all()
+    by_id = {item.id: item for item in types}
+    lines = [
+        f"@prefix : <{space.iri}#> .",
+        "@prefix skos: <http://www.w3.org/2004/02/skos/core#> .",
+        "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .",
+        "",
+        f"<{space.iri}/scheme> a skos:ConceptScheme ;",
+        f"    skos:prefLabel {_ttl(space.name)} .",
+        "",
+    ]
+    for item in types:
+        local = _local(item.label)
+        lines.append(f":{local} a skos:Concept ;")
+        lines.append(f"    skos:prefLabel {_ttl(item.label)} ;")
+        lines.append(f"    skos:inScheme <{space.iri}/scheme> ;")
+        if item.definition:
+            lines.append(f"    skos:definition {_ttl(item.definition)} ;")
+        for alias in item.aliases or []:
+            lines.append(f"    skos:altLabel {_ttl(alias)} ;")
+        if item.parent_id and item.parent_id in by_id:
+            lines.append(f"    skos:broader :{_local(by_id[item.parent_id].label)} ;")
+        children = [child for child in types if child.parent_id == item.id]
+        for child in children:
+            lines.append(f"    skos:narrower :{_local(child.label)} ;")
+        lines[-1] = lines[-1].rstrip(" ;") + " ."
+        lines.append("")
+    return "\n".join(lines)
+
+
+def export_json_schemas(session, space_id: int) -> dict[str, Any]:
+    types = session.execute(
+        select(ObjectType).where(ObjectType.space_id == space_id).order_by(ObjectType.label)
+    ).scalars().all()
+    output: dict[str, Any] = {}
+    for item in types:
+        props = session.execute(
+            select(DataPropertyDef, TypeDataProperty)
+            .join(TypeDataProperty, TypeDataProperty.property_id == DataPropertyDef.id)
+            .where(TypeDataProperty.type_id == item.id)
+            .order_by(TypeDataProperty.ordinal)
+        ).all()
+        constraints = session.execute(
+            select(Constraint).where(Constraint.type_id == item.id, Constraint.is_active.is_(True))
+        ).scalars().all()
+        schema: dict[str, Any] = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": item.iri,
+            "title": item.label,
+            "description": item.definition or "",
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "x-ontology": {
+                "kind": item.kind,
+                "business_domain": item.business_domain,
+                "confidence": item.confidence,
+                "version": item.version,
+                "aliases": item.aliases or [],
+            },
+        }
+        for prop, link in props:
+            entry: dict[str, Any] = {
+                "title": prop.label,
+                "type": JSON_TYPE_MAP.get(prop.data_type, "string"),
+            }
+            if prop.data_type == "enum" and prop.enum_values:
+                entry["enum"] = list(prop.enum_values)
+            if prop.unit:
+                entry["x-unit"] = prop.unit
+            if prop.description:
+                entry["description"] = prop.description
+            schema["properties"][prop.key] = entry
+            if prop.is_required or link.is_required:
+                schema["required"].append(prop.key)
+
+        shacl: list[dict[str, Any]] = []
+        for constraint in constraints:
+            shacl.append(
+                {
+                    "kind": constraint.kind,
+                    "severity": constraint.severity,
+                    "expression": constraint.expression,
+                    "message": constraint.message,
+                    "regulation_ref": constraint.regulation_ref,
+                }
+            )
+        if shacl:
+            schema["x-shacl"] = shacl
+        output[item.label] = schema
+    return output
+
+
+def export_bundle(session, space_id: int) -> dict[str, Any]:
+    space = session.get(OntologySpace, space_id)
+    if space is None:
+        return {"status": "missing"}
     return {
-        "spaces/space-{}-{}.ttl".format(space_id, space.name): turtle,
-        "spaces/space-{}-{}.skos.ttl".format(space_id, space.name): skos,
-        **{f"spaces/jsonschema/{k}.json": v for k, v in schemas.items()},
+        "status": "ok",
+        "space": {
+            "id": space.id,
+            "key": space.key,
+            "name": space.name,
+            "iri": space.iri,
+            "domain": space.domain,
+        },
+        "turtle": export_turtle(session, space_id),
+        "skos": export_skos(session, space_id),
+        "json_schema": export_json_schemas(session, space_id),
     }

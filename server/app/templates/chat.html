@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}问答 · RAG{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>问答 · RAG</h1>
+    <p class="muted">
+      查询理解 → BM25 + 向量双路召回 → RRF 融合 → 重排 → MMR 去冗 → 流式生成 → 引用绑定。
+      答案里的 <code>[c1]</code> 可点击，未被引用的片段不会伪装成来源。
+    </p>
+  </header>
+
+  <form id="ask-form" class="ask-form" data-stream="/api/rag/stream">
+    <textarea id="ask-input" name="q" rows="3" required
+      placeholder="例如：信贷合同中年利率的合规上限是多少？">{{ question or '' }}</textarea>
+    <div class="ask-actions">
+      <button type="submit" class="btn primary">提问</button>
+      <button type="button" class="btn" id="draft-btn" data-space="{{ space_id }}">按本题生成本体草案</button>
+      <span id="ask-status" class="muted small"></span>
+    </div>
+  </form>
+
+  {% if sample_questions %}
+  <div class="chips">
+    {% for item in sample_questions %}
+    <button type="button" class="chip" data-ask="{{ item }}">{{ item }}</button>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+
+<section class="panel" id="answer-panel" hidden>
+  <header class="panel-head">
+    <h2>回答</h2>
+    <span id="answer-meta" class="muted small"></span>
+  </header>
+  <div class="plan-row" id="plan-row"></div>
+  <article id="answer" class="answer prose"></article>
+  <div id="citations" class="citations"></div>
+</section>
+
+<section class="panel" id="retrieval-panel" hidden>
+  <header class="panel-head">
+    <h2>检索轨迹</h2>
+    <span class="muted small">每一路召回的来源、RRF 分与图感知加权都记录在此</span>
+  </header>
+  <div id="retrieval" class="retrieval"></div>
+</section>
+
+<section class="panel" id="draft-panel" hidden>
+  <header class="panel-head">
+    <h2>本体草案</h2>
+    <span class="muted small">草案只产出提案，必须到「提案审核」人工确认</span>
+  </header>
+  <div id="draft-result" class="list"></div>
+  <p><a class="btn primary" id="to-proposals" href="/proposals?space={{ space_id }}">前往提案审核</a></p>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/stream.js"></script>
+{% endblock %}

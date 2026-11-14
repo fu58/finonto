@@ -1,154 +1,138 @@
-"""受限 Python 执行沙箱。
+"""代码沙箱：AST 白名单 + 子进程隔离 + 超时 + 输出上限。
 
-防护分三层：
-1) AST 静态校验 —— 只允许白名单模块、禁止双下划线属性、禁止 open/exec/eval/compile/__import__；
-2) 独立子进程执行 —— `-I -S -B` 隔离站点配置与用户 site-packages，不继承环境变量；
-3) 超时与输出上限 —— 超时即 kill，stdout 截断，防止把结果塞爆上下文。
+为什么不是「直接 exec」
+---------------------
+在本机可信用户假设下，最危险的并不是恶意代码，而是**误操作**：删文件、起进程、
+连外网。AST 白名单把「能 import 什么、能调用什么、能碰哪些名字」先卡死，
+再用独立子进程 + 超时兜底。两道闸门都过不了就不执行。
 
-生产部署建议再叠加容器/只读文件系统/seccomp（见 README 的部署章节）。
+允许的模块都是纯计算类（json/math/statistics/re/datetime/collections/itertools/random/textwrap），
+不包含 os/sys/subprocess/socket/pathlib。
 """
 
 from __future__ import annotations
 
 import ast
-import subprocess
-import sys
-import tempfile
-from dataclasses import dataclass
+import time
 from pathlib import Path
+from typing import Any
 
-from ...config import settings
+from ...config import get_settings
 
-ALLOWED_IMPORTS = {
-    "json",
-    "math",
-    "statistics",
-    "datetime",
-    "decimal",
-    "fractions",
-    "re",
-    "itertools",
-    "functools",
-    "collections",
-    "heapq",
-    "bisect",
-    "textwrap",
-    "unicodedata",
-    "copy",
-    "hashlib",
-    "base64",
-    "string",
-    "typing",
-    "dataclasses",
-    "enum",
-    "operator",
+ALLOWED_MODULES = {
+    "json", "math", "statistics", "re", "datetime", "collections",
+    "itertools", "random", "textwrap", "decimal", "fractions", "string",
 }
-BANNED_ATTR_PREFIXES = ("__", "_ctypes", "gi_", "cr_")
+FORBIDDEN_NAMES = {
+    "eval", "exec", "compile", "open", "input", "breakpoint",
+    "__import__", "globals", "locals", "vars", "getattr", "setattr", "delattr",
+    "exit", "quit", "memoryview",
+}
+FORBIDDEN_ATTRS = {"__globals__", "__class__", "__bases__", "__subclasses__", "__code__", "__dict__"}
+MAX_CODE_CHARS = 6000
+MAX_OUTPUT_CHARS = 8000
 
 
-class SandboxError(RuntimeError):
-    pass
+class _Guard(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.blocked: list[dict[str, Any]] = []
+
+    def _block(self, node: ast.AST, reason: str) -> None:
+        self.blocked.append(
+            {"reason": reason, "line": getattr(node, "lineno", 0)}
+        )
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            root = alias.name.split(".")[0]
+            if root not in ALLOWED_MODULES:
+                self._block(node, f"禁止导入模块 {root}")
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        root = (node.module or "").split(".")[0]
+        if root and root not in ALLOWED_MODULES:
+            self._block(node, f"禁止导入模块 {root}")
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id in FORBIDDEN_NAMES:
+            self._block(node, f"禁止使用名称 {node.id}")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in FORBIDDEN_ATTRS:
+            self._block(node, f"禁止访问属性 {node.attr}")
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_NAMES:
+            self._block(node, f"禁止调用 {node.func.id}")
+        self.generic_visit(node)
 
 
-@dataclass
-class SandboxResult:
-    ok: bool
-    stdout: str
-    stderr: str
-    exit_code: int
-    elapsed_ms: int
-    violations: list[str]
-
-
-def validate_source(code: str) -> list[str]:
-    violations: list[str] = []
+def validate(code: str) -> dict[str, Any]:
+    if not code or not code.strip():
+        return {"ok": False, "blocked": [{"reason": "代码为空", "line": 0}]}
+    if len(code) > MAX_CODE_CHARS:
+        return {"ok": False, "blocked": [{"reason": f"代码超过 {MAX_CODE_CHARS} 字符", "line": 0}]}
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
-        return [f"语法错误: {exc.msg} (行 {exc.lineno})"]
-
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            names = (
-                [alias.name.split(".")[0] for alias in node.names]
-                if isinstance(node, ast.Import)
-                else [(node.module or "").split(".")[0]]
-            )
-            for name in names:
-                if name not in ALLOWED_IMPORTS:
-                    violations.append(f"禁止导入模块 {name}（白名单: {', '.join(sorted(ALLOWED_IMPORTS))}）")
-        if isinstance(node, ast.Attribute):
-            if node.attr.startswith(BANNED_ATTR_PREFIXES):
-                violations.append(f"禁止访问内部属性 {node.attr}")
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            if node.id.startswith("__"):
-                violations.append(f"禁止绑定 {node.id}")
-        if isinstance(node, ast.Call):
-            func = node.func
-            name = getattr(func, "id", None) or getattr(func, "attr", None)
-            if name in {"open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars", "input", "breakpoint", "memoryview", "exit", "quit"}:
-                violations.append(f"禁止调用 {name}()")
-            if name == "getattr" or name == "setattr":
-                violations.append(f"禁止调用 {name}() 绕过属性检查")
-    return violations
+        return {"ok": False, "blocked": [{"reason": f"语法错误：{exc.msg}", "line": exc.lineno or 0}]}
+    guard = _Guard()
+    guard.visit(tree)
+    return {"ok": not guard.blocked, "blocked": guard.blocked}
 
 
-_PRELUDE = """
-import builtins as _b
-_ALLOWED = {allowed!r}
-_b.dont_write_bytecode = True
-def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name.split('.')[0] not in _ALLOWED:
-        raise ImportError('沙箱禁止导入模块: ' + name)
-    return _b.__import__(name, globals, locals, fromlist, level)
-_b.__import__ = _safe_import
-"""
-
-
-def run_python(code: str, *, timeout: float | None = None, stdin_data: str = "") -> SandboxResult:
-    import time
-
+def run(code: str) -> dict[str, Any]:
+    settings = get_settings()
     if not settings.sandbox_enabled:
-        return SandboxResult(False, "", "沙箱已被配置禁用（FINONTO_SANDBOX_ENABLED=false）", -1, 0, [])
-    violations = validate_source(code)
-    if violations:
-        return SandboxResult(False, "", "静态校验未通过", 1, 0, violations)
+        return {"ok": False, "error": "沙箱已在配置中关闭（FINONTO_SANDBOX_ENABLED=false）"}
+
+    check = validate(code)
+    if not check["ok"]:
+        return {
+            "ok": False,
+            "blocked": check["blocked"],
+            "error": "代码未通过 AST 白名单检查，已拒绝执行",
+        }
+
+    import subprocess
+    import sys
+
+    workdir = Path(settings.sandbox_dir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    script = workdir / f"run_{int(time.time() * 1000)}.py"
+    script.write_text(code, encoding="utf-8")
 
     started = time.perf_counter()
-    workdir = Path(settings.sandbox_workdir)
-    workdir.mkdir(parents=True, exist_ok=True)
-    script = workdir / f"snippet_{int(time.time() * 1000)}.py"
-    script.write_text(_PRELUDE.format(allowed=sorted(ALLOWED_IMPORTS)) + "\n" + code, encoding="utf-8")
-    env = {"PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"}
     try:
-        completed = subprocess.run(  # noqa: S603
-            [sys.executable, "-I", "-S", "-B", str(script)],
+        proc = subprocess.run(
+            [sys.executable, "-I", "-X", "utf8", str(script)],
             capture_output=True,
             text=True,
-            timeout=timeout or settings.sandbox_timeout_s,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            input=stdin_data,
+            timeout=settings.sandbox_timeout_s,
             cwd=str(workdir),
         )
-        stdout = (completed.stdout or "")[: settings.sandbox_max_output]
-        stderr = (completed.stderr or "")[:4000]
-        ok = completed.returncode == 0
-        return SandboxResult(ok, stdout, stderr, completed.returncode, int((time.perf_counter() - started) * 1000), [])
+        elapsed = int((time.perf_counter() - started) * 1000)
+        stdout = (proc.stdout or "")[:MAX_OUTPUT_CHARS]
+        stderr = (proc.stderr or "")[:MAX_OUTPUT_CHARS]
+        return {
+            "ok": proc.returncode == 0,
+            "stdout": stdout,
+            "stderr": stderr,
+            "returncode": proc.returncode,
+            "elapsed_ms": elapsed,
+        }
     except subprocess.TimeoutExpired:
-        return SandboxResult(
-            False,
-            "",
-            f"执行超时（>{timeout or settings.sandbox_timeout_s}s），进程已终止",
-            124,
-            int((time.perf_counter() - started) * 1000),
-            [],
-        )
-    except OSError as exc:
-        raise SandboxError(f"沙箱启动失败: {exc}") from exc
+        return {
+            "ok": False,
+            "error": f"执行超时（>{settings.sandbox_timeout_s}s），已终止",
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        }
     finally:
         try:
-            script.unlink()
+            script.unlink(missing_ok=True)
         except OSError:
             pass

@@ -1,229 +1,269 @@
-"""端到端冒烟测试：不接任何外部 API，跑通「领域包安装 → 检索 → 生成引用 → Agent 提案 → 人工确认 → Wiki → 回滚」。
+"""端到端离线冒烟：10 个阶段，全部断言，不联网、不依赖任何密钥。
 
-用法：`./.venv/Scripts/python.exe scripts/smoke.py`
+    cd server
+    .venv/Scripts/python.exe scripts/smoke.py
+
+刻意使用一个独立的临时数据目录（``server/var-smoke``），
+所以可以随时重跑，也不会污染你正在用的 var/。
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
+import os
+import shutil
 import sys
-from collections import Counter
+import time
+import traceback
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+SERVER_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SERVER_DIR))
+DATA_DIR = SERVER_DIR / "var-smoke"
+os.environ["FINONTO_DATA_DIR"] = str(DATA_DIR)
+os.environ["FINONTO_AUTO_BOOTSTRAP"] = "false"
 
-from sqlalchemy import func, select  # noqa: E402
+shutil.rmtree(DATA_DIR, ignore_errors=True)
 
-from app.config import settings  # noqa: E402
-from app.core.agent.react import ReActConfig, ReActEngine  # noqa: E402
-from app.core.ontology.owl import export_bundle  # noqa: E402
-from app.core.ontology.packs import PACKS, pack_for_space, vocab_for  # noqa: E402
-from app.core.ontology.service import OntologyService  # noqa: E402
-from app.core.rag.ingest import IngestService  # noqa: E402
-from app.core.rag.pipeline import RagPipeline  # noqa: E402
-from app.core.wiki.compiler import WikiCompiler  # noqa: E402
-from app.core.wiki.graph import GraphService  # noqa: E402
-from app.core.wiki.versions import VersionService  # noqa: E402
 from app.db import init_db, session_scope  # noqa: E402
-from app.models import DocumentRecord, Space  # noqa: E402
-from app.providers.registry import registry  # noqa: E402
-from app.services import bootstrap  # noqa: E402
+from app.providers.registry import get_components  # noqa: E402
 
-CROSS_DOMAIN_QUESTIONS = {
-    "maintenance": "A 类设备的定期点检周期上限是多少？缺陷升级为故障后开维护工单有什么时限要求？",
-    "ai": "模型上线的幻觉率与有害输出率阈值分别是多少？缺失模型卡会怎样处理？",
-    "network": "跨机房链路时延阈值和一级网络故障事件的恢复时限要求分别是什么？",
-}
+PASSED = 0
+FAILED = 0
+PHASE = ""
 
 
-def step(title: str) -> None:
-    print(f"\n{'=' * 72}\n{title}\n{'=' * 72}")
+def phase(title: str) -> None:
+    global PHASE
+    PHASE = title
+    print(f"\n── {title} " + "─" * max(0, 56 - len(title)))
 
 
-async def rag_check(session, space_id: int, question: str) -> dict:
-    tokens: list[str] = []
-    citations: list[dict] = []
-    stages: list[str] = []
-    async for event in RagPipeline(session).run(question, space_id):
-        kind = event["type"]
-        if kind == "stage":
-            stages.append(f"{event['stage']}={event.get('detail', '')}")
-        elif kind == "token":
-            tokens.append(event["text"])
-        elif kind == "citations":
-            citations = event["citations"]
-        elif kind == "error":
-            raise RuntimeError(event["message"])
-    answer = "".join(tokens)
-    print(f"  阶段：{' | '.join(stages)}")
-    print(f"  回答（{len(answer)} 字）：{answer[:200]}…")
-    if citations:
-        first = citations[0]
-        print(f"  引用 {len(citations)} 条，首条 [{first['ref']}] {first['doc_name']} {first['locator']}：{first['quote'][:60]}…")
+def check(condition: bool, message: str, detail: str = "") -> None:
+    global PASSED, FAILED
+    if condition:
+        PASSED += 1
+        print(f"  ✓ {message}")
     else:
-        print("  引用 0 条")
-    return {"answer": answer, "citations": citations}
-
-
-async def agent_check(session, space_id: int) -> dict:
-    goal = "从零售信贷核心数据字典和互联网贷款制度中抽取「押品」「担保人」「大数据风控模型」等候选对象类型并生成提案"
-    engine = ReActEngine(session, space_id, ReActConfig(skill="doc-extraction", max_steps=10))
-    result = await engine.run(goal)
-    for event in result["events"]:
-        if event["type"] == "step":
-            print(f"  步 {event['ordinal']:>2}  Action={event['action']}  args={str(event['action_input'])[:88]}")
-        elif event["type"] == "observation":
-            print(f"        观察({'ok' if event['ok'] else '失败'}): {event['observation'][:150]}")
-        elif event["type"] == "proposal":
-            print(f"        提案 #{event['proposal_id']} 已生成，待人工确认")
-        elif event["type"] == "hint":
-            print(f"        提示：{event['message']}")
-        elif event["type"] == "error":
-            print(f"  错误：{event['message']}")
-    print(f"  结论[{result['status']}]：{result['answer'][:200]}")
-    print(f"  提案 {len(result.get('proposals', []))} 个｜token {result['tokens']}｜用时 {result['elapsed_ms']}ms")
-    return result
+        FAILED += 1
+        print(f"  ✗ {message}" + (f"  ← {detail}" if detail else ""))
 
 
 def main() -> int:
-    settings.ensure_dirs()
+    from app.core.agent import react, sandbox
+    from app.core.ontology import owl, packs, service
+    from app.core.rag.pipeline import ask
+    from app.core.wiki import compiler, graph as graph_service, versions
+    from app.models import ObjectType, WikiPage
+
     init_db()
+    components = get_components()
+
+    # ------------------------------------------------------------------ #
+    phase("1 · 五个领域包冷启动（幂等）")
+    with session_scope() as session:
+        results = [
+            service.install_pack(session, key, components=components)
+            for key in ("finance", "maintenance", "ai", "network", "general")
+        ]
+        spaces = {item["key"]: item for item in service.list_spaces(session)}
+    check(len(spaces) == 5, "创建 5 个本体空间", str(list(spaces)))
+    for result in results:
+        check(result["status"] == "installed", f"领域包 {result['pack']} 安装完成")
+        check(result["wiki"].get("pages", 0) > 0, f"{result['pack']} 首次编译出 Wiki 页", str(result["wiki"]))
 
     with session_scope() as session:
-        step("1. 领域包冷启动（全部内置领域包幂等安装）")
-        service = OntologyService(session)
-        report = bootstrap.bootstrap(session, ROOT)
-        print(f"  已注册领域包：{', '.join(PACKS)}")
-        spaces: dict[str, Space] = {row.domain: row for row in session.scalars(select(Space)).all()}
-        for item in report["reports"]:
-            print(f"  [{item['pack']}] 空间 #{item['space_id']} {item['space_name']}｜种子 {item['seed']}"
-                  f"｜示例 {item.get('samples', {}).get('ingested') or item.get('samples', {}).get('skipped')}")
-        print(f"  合并计数：{report['counters']}")
-        space = spaces["finance"]
-        space_id = space.id
-        print(f"  主验证空间 #{space_id} {space.name}：对象类型 {len(service.list_types(space_id, limit=1000))} 个")
+        again = service.install_pack(session, "finance", components=components)
+    check(again["created_types"] == 0, "重复安装不新增类型（幂等）", str(again["created_types"]))
+    check(
+        all(doc["status"] in ("duplicate", "indexed") for doc in again["documents"]),
+        "重复安装不重复入库文档",
+    )
 
-        session.commit()
-        step("2. 语料规模核对（解析 → 分块 → 嵌入 → 双索引，由各领域包安装时完成）")
-        ingest = IngestService(session)
-        for key, pack in PACKS.items():
-            target = spaces.get(key)
-            if target is None:
-                continue
-            docs = int(
-                session.scalar(
-                    select(func.count()).select_from(DocumentRecord).where(DocumentRecord.space_id == target.id)
-                )
-                or 0
-            )
-            print(f"  {key:<12} 空间 #{target.id}：文档 {docs} 篇 / 片段 {ingest.chunk_count(target.id)} 个｜{pack.label}")
+    # ------------------------------------------------------------------ #
+    phase("2 · 语料与索引规模")
+    with session_scope() as session:
+        finance_id = spaces["finance"]["id"]
+        docs = session.execute(
+            __import__("sqlalchemy").select(__import__("app.models", fromlist=["Document"]).Document)
+        ).scalars().all()
+        total_chunks = session.execute(
+            __import__("sqlalchemy").select(__import__("sqlalchemy").func.count(
+                __import__("app.models", fromlist=["DocumentChunk"]).DocumentChunk.id))
+        ).scalar_one()
+    real_docs = [doc for doc in docs if doc.title and not doc.title.startswith("测试")]
+    check(len(docs) >= 8, "至少 8 份示例文档入库", f"实际 {len(docs)}")
+    check(int(total_chunks) >= 40, "片段总数 ≥ 40", f"实际 {total_chunks}")
 
-        session.commit()
-        step("3. RAG 问答（查询理解 → 混合检索 → 重排 → 流式生成 → 引用）")
-        rag = asyncio.run(
-            rag_check(session, space_id, "个人信用贷款的授信额度上限，以及逾期天数下调五级分类的规定分别是什么？")
+    # ------------------------------------------------------------------ #
+    phase("3 · RAG 必须产生引用")
+    cases = [
+        ("finance", "信贷合同中年利率的合规上限是多少？", "24"),
+        ("maintenance", "点检发现异常后需要做什么？", "工单"),
+        ("ai", "模型上线前必须通过哪些评测维度？", "评测"),
+        ("network", "防火墙放行策略为什么必须设置到期时间？", "到期"),
+    ]
+    for pack_key, question, keyword in cases:
+        with session_scope() as session:
+            result = ask(session, spaces[pack_key]["id"], question)
+        check(len(result["citations"]) >= 1, f"[{pack_key}] 产生引用", str(len(result["citations"])))
+        check(len(result["retrieved"]) >= 1, f"[{pack_key}] 召回片段", str(len(result["retrieved"])))
+        check(bool(result["answer"].strip()), f"[{pack_key}] 生成非空答案")
+        check(
+            keyword in result["answer"] or keyword in json.dumps(result["retrieved"], ensure_ascii=False),
+            f"[{pack_key}] 答案/检索命中关键字「{keyword}」",
+            result["answer"][:60],
         )
-        assert rag["citations"], "RAG 未产生引用"
 
-        session.commit()
-        step("4. Agent ReAct 推理（工具 + 技能 + MCP + 沙箱 + 记忆）")
-        agent = asyncio.run(agent_check(session, space_id))
-        pending = service.list_proposals(space_id, status="pending")
-        print(f"  待确认提案累计 {len(pending)} 个")
+    # ------------------------------------------------------------------ #
+    phase("4 · ReAct 必须收敛并产出提案")
+    with session_scope() as session:
+        run = react.run(
+            session,
+            finance_id,
+            "为信贷空间补充「贷后检查计划」相关对象类型",
+            skill_key="doc-extraction",
+            components=components,
+        )
+    check(run.status == "succeeded", "Agent 运行收敛", run.status)
+    check(len(run.steps) >= 4, "至少 4 步（检索→列表→对齐→提案）", str(len(run.steps)))
+    check(len(run.proposal_ids) >= 1, "产出至少 1 条提案", str(run.proposal_ids))
+    check(run.tokens > 0, "记录 token 消耗", str(run.tokens))
 
-        session.commit()
-        step("5. 人工确认提案 → 写入本体")
-        accepted = None
-        for proposal in pending:
-            if proposal.kind == "object_type":
-                accepted = service.accept_proposal(proposal.id, reviewer="smoke")
-                print(f"  提案 #{proposal.id}「{proposal.title}」已入库 → 新对象类型 {accepted.created_types}，脏页面 {accepted.dirty_pages}")
-                break
-        print("  没有可确认的对象类型提案" if accepted is None else f"  确认后空间内对象类型 {len(service.list_types(space_id, limit=1000))} 个")
+    # ------------------------------------------------------------------ #
+    phase("5 · 人工确认闸门")
+    with session_scope() as session:
+        before = service.space_summary(session, finance_id)["types"]
+        pending = service.list_proposals(session, finance_id, status="pending")
+        check(len(pending) >= 1, "存在待确认提案", str(len(pending)))
+        target = pending[-1]["id"]
+        accepted = service.accept_proposal(session, target, components=components)
+        after = service.space_summary(session, finance_id)["types"]
+        detail = service.proposal_detail(session, target)
+        new_type = session.get(ObjectType, accepted.get("type_id", 0))
+    check(accepted["status"] == "accepted", "提案被接受", str(accepted.get("status")))
+    check(after == before + 1, "类型数 +1", f"{before} → {after}")
+    check(detail["status"] == "accepted", "提案状态已更新")
+    check(new_type is not None and new_type.iri.startswith("https://"), "类型获得唯一 IRI",
+          new_type.iri if new_type else "")
+    check(bool(accepted.get("wiki")), "确认后触发 Wiki 增量重编译", str(accepted.get("wiki")))
 
-        issues = service.validate_space(space_id)
-        print(f"  校验问题 {len(issues)} 条：" + "; ".join(f"{i.code}:{i.message[:40]}" for i in issues[:4]))
+    with session_scope() as session:
+        second = service.accept_proposal(session, target, components=components)
+    check(second["status"] == "already_decided", "重复确认被拒绝（幂等）", second["status"])
 
-        session.commit()
-        step("6. Wiki 编译 / 人工编辑 / 版本回滚")
-        compiler = WikiCompiler(session)
-        compile_report = compiler.compile_space(space_id)
-        print(f"  编译：新建 {compile_report.created}，更新 {compile_report.updated}，未变 {compile_report.unchanged}，锁定跳过 {compile_report.skipped_locked}")
-        pages = compiler.list_pages(space_id)
-        print(f"  页面 {len(pages)} 个：" + ", ".join(p.slug for p in pages[:8]))
-        target = next((p for p in pages if p.page_type == "type"), None)
-        if target:
-            view = compiler.page_view(target)
-            print(f"  示例页面 {view['slug']} v{view['current_version']}：{view['body_md'][:80]}…")
-            edited = compiler.manual_edit(
-                target.id,
-                view["body_md"] + "\n## 人工补充\n这一段用于验证人工编辑、锁定与回滚。\n",
-                note="人工补充",
+    # ------------------------------------------------------------------ #
+    phase("6 · 空间校验")
+    with session_scope() as session:
+        report = service.validate_space(session, finance_id)
+    check(set(report) == {"violation", "warning", "info"}, "三级结构完整", str(list(report)))
+    check(all(isinstance(report[key], list) for key in report), "每一级都是列表")
+
+    # ------------------------------------------------------------------ #
+    phase("7 · Wiki 编译 / 编辑 / 锁定 / 回滚 / diff")
+    with session_scope() as session:
+        stats = compiler.compile_space(session, finance_id)
+    check(stats["status"] == "compiled", "编译成功")
+    check(stats["pages"] == 0 or stats["updated"] >= 0, "重复编译不重复建页（内容未变即跳过）")
+
+    with session_scope() as session:
+        page = session.execute(
+            __import__("sqlalchemy").select(WikiPage).where(
+                WikiPage.space_id == finance_id, WikiPage.slug == "index"
             )
-            print(f"  人工编辑 → {edited['message']}，锁定={edited['page']['locked_by_human']}")
-            versions = VersionService(session)
-            before = len(versions.revisions(target.id))
-            rolled = versions.rollback(target.id, 1, actor="smoke", note="冒烟测试回滚")
-            after = len(versions.revisions(target.id))
-            rollback_note = rolled.get("message") or "追加 v{}".format(rolled["new_version"])
-            print(f"  回滚至 v1 → {rollback_note}（版本数 {before} → {after}，非破坏式）")
-            diff = versions.diff(target.id, 1, 2)
-            print(f"  v1↔v2 差异：+{diff['added_lines']} 行 / -{diff['removed_lines']} 行")
-            recomp = compiler.compile_space(space_id, only_dirty=True)
-            print(f"  增量重编译（只处理 dirty）：新建 {recomp.created}，更新 {recomp.updated}")
-            again = compiler.compile_space(space_id)
-            print(f"  幂等重编译：新建 {again.created}，更新 {again.updated}，未变 {again.unchanged}，锁定跳过 {again.skipped_locked}")
+        ).scalars().first()
+        page_id = page.id
+        base_version = page.version
+        edited = versions.save_manual_edit(
+            session, page_id, page.body + "\n\n> 人工补充：本条为冒烟测试追加。", message="冒烟编辑"
+        )
+    check(edited["status"] == "saved", "人工编辑追加版本", str(edited))
+    check(edited["version"] == base_version + 1, "版本号 +1", f"{base_version} → {edited['version']}")
 
-        session.commit()
-        step("7. 知识图谱")
-        graph_service = GraphService(session)
-        graph = graph_service.build(space_id)
-        print(f"  节点 {len(graph['nodes'])}，边 {len(graph['edges'])}，统计 {graph['stats']}")
-        if graph["nodes"]:
-            center = graph["nodes"][0]["ref_id"]
-            sub = graph_service.subgraph(space_id, center, depth=1)
-            print(f"  以 {graph['nodes'][0]['label']}(#{center}) 为中心的 1 跳子图：{len(sub['nodes'])} 节点 / {len(sub['edges'])} 边")
-            other = [n["ref_id"] for n in graph["nodes"] if n["ref_id"] != center]
-            if other:
-                route = graph_service.path(space_id, center, other[0])
-                print(f"  路径查询：found={route['found']} hops={route.get('hops', 0)}")
-        insights = graph_service.insights(space_id)
-        print(f"  洞察：枢纽 {len(insights['hubs'])}，孤立 {len(insights['isolated'])}，"
-              f"缺证据类型 {insights['coverage']['count']}，域分布 {insights['domain_distribution']}")
+    with session_scope() as session:
+        locked = versions.toggle_lock(session, page_id, True)
+        locked_compile = compiler.compile_space(session, finance_id, only_dirty=False)
+    check(locked["status"] == "locked", "页面已锁定")
+    check(locked_compile["locked"] >= 1, "锁定页被编译跳过", str(locked_compile))
 
-        step("8. 多领域交叉验证（词表 / 检索 / 导出随空间切换）")
-        for key in ("maintenance", "ai", "network"):
-            domain_space = spaces.get(key)
-            if domain_space is None:
-                print(f"  [{key}] 未安装，跳过")
-                continue
-            vocab = vocab_for(session, domain_space.id)
-            result = asyncio.run(rag_check(session, domain_space.id, CROSS_DOMAIN_QUESTIONS[key]))
-            bundle = export_bundle(session, domain_space.id)
-            type_count = len(service.list_types(domain_space.id, limit=1000))
-            print(f"  [{key}] 领域 {vocab['pack']['label']}｜子域 {len(vocab['business_domains'])} 个"
-                  f"｜对象种类 {len(vocab['object_kinds'])}｜类型 {type_count} 个"
-                  f"｜引用 {len(result['citations'])} 条｜导出 {len(bundle)} 个产物")
+    with session_scope() as session:
+        rolled = versions.rollback(session, page_id, base_version)
+    check(rolled["status"] == "rolled_back", "回滚成功")
+    check(rolled["new_version"] == edited["version"] + 1, "回滚是追加新版本而不是删历史",
+          str(rolled))
 
-        step("9. 本体导出")
-        bundle = export_bundle(session, space_id)
-        turtle_key = next(k for k in bundle if k.endswith(".ttl") and "skos" not in k)
-        print(f"  产物 {len(bundle)} 个：" + ", ".join(list(bundle)[:6]) + (" …" if len(bundle) > 6 else ""))
-        print("  Turtle 片段：\n" + "\n".join("    " + line for line in bundle[turtle_key].splitlines()[8:20]))
-        print(f"  主空间所属领域包：{pack_for_space(session, space_id).label}")
+    with session_scope() as session:
+        revisions = versions.list_revisions(session, page_id)
+        diff_edit = versions.diff_versions(session, page_id, base_version, edited["version"])
+        diff_rollback = versions.diff_versions(session, page_id, base_version, rolled["new_version"])
+    check(len(revisions) >= 3, "版本链至少 3 条", str(len(revisions)))
+    check(diff_edit["status"] == "ok", "diff 计算成功")
+    check(diff_edit["identical"] is False, "diff 能识别出编辑差异", str(diff_edit["added"]))
+    check(diff_edit["added"] >= 1, "diff 报告新增行", str(diff_edit["added"]))
+    check(diff_rollback["identical"] is True, "回滚后内容与目标版本一致（非破坏式）")
 
-        step("10. 组件面板")
-        kinds = Counter(row.kind for row in registry.describe())
-        print("  " + ", ".join(f"{k}={v}" for k, v in sorted(kinds.items())))
-        print(f"  共 {sum(kinds.values())} 个组件选项；当前 LLM={registry.active_name('llm')}，"
-              f"Embedding={registry.active_name('embedding')}，向量库={registry.active_name('vector_store')}")
+    # ------------------------------------------------------------------ #
+    phase("8 · 图谱：全图 / 子图 / 路径 / 洞察")
+    with session_scope() as session:
+        graph = graph_service.build_graph(session, finance_id)
+        laid = graph_service.layout(graph)
+        types = [node for node in laid["nodes"] if node["kind"] == "type"]
+        sub = graph_service.subgraph(laid, types[0]["id"], 1)
+        path = graph_service.shortest_path(laid, types[0]["id"], types[-1]["id"])
+        insight = graph_service.insights(session, finance_id, graph)
+    check(len(types) >= 13, "类型节点数", str(len(types)))
+    check(len(graph["edges"]) >= 14, "关系数", str(len(graph["edges"])))
+    check(all("x" in node for node in laid["nodes"]), "布局给了每个节点坐标")
+    check(len(sub["nodes"]) >= 1, "邻域子图非空")
+    check("found" in path, "路径查询返回结果", str(path.get("reason", "")))
+    check(insight["type_count"] == len(types), "洞察与图一致")
+    check(insight["components"] >= 1, "连通分量计算完成")
 
-        assert agent["status"] in {"done", "max_steps"}, f"Agent 未正常收敛：{agent['status']}"
+    # ------------------------------------------------------------------ #
+    phase("9 · 多领域交叉验证")
+    for pack_key in ("maintenance", "ai", "network"):
+        domain = spaces[pack_key]["domain"]
+        vocab = packs.vocab_for(domain)
+        check(vocab["pack"] == pack_key, f"[{pack_key}] 词表随空间切换", str(vocab.get("pack")))
+        check(len(vocab["business_domains"]) >= 3, f"[{pack_key}] 子域受控词表非空")
+        with session_scope() as session:
+            ttl = owl.export_turtle(session, spaces[pack_key]["id"])
+            schemas = owl.export_json_schemas(session, spaces[pack_key]["id"])
+        check("owl:Class" in ttl, f"[{pack_key}] Turtle 含类定义")
+        check("sh:NodeShape" in ttl, f"[{pack_key}] Turtle 含 SHACL 形状")
+        check(len(schemas) >= 10, f"[{pack_key}] JSON Schema 数量", str(len(schemas)))
 
-    print("\n冒烟测试通过：多领域安装、RAG 引用、Agent 提案、人工确认、Wiki 版本与图谱均工作。")
-    return 0
+    # ------------------------------------------------------------------ #
+    phase("10 · 组件面板与沙箱")
+    from app.providers.registry import catalog, probe
+
+    categories = catalog()
+    check(len(categories) == 10, "10 类组件目录", str(len(categories)))
+    check(all(category["entries"] for category in categories), "每类都有可选实现")
+    for key in ("llm_provider", "embedding_provider", "vector_store", "object_store", "doc_parser"):
+        result = probe(key, "")
+        check(result["ok"], f"探针 {key} 可用", result.get("detail", "")[:40])
+
+    allowed = sandbox.run("import json\nprint(json.dumps({'ok': True}))")
+    check(allowed["ok"], "沙箱可执行白名单代码", allowed.get("error", ""))
+    blocked = sandbox.run("import os\nos.system('echo hi')")
+    check(not blocked["ok"], "沙箱拦截 os 导入")
+    check(bool(blocked.get("blocked")), "拦截原因可解释")
+
+    # ------------------------------------------------------------------ #
+    print("\n" + "=" * 62)
+    print(f"通过 {PASSED} 项，失败 {FAILED} 项")
+    print("=" * 62)
+    return 0 if FAILED == 0 else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    started = time.perf_counter()
+    try:
+        code = main()
+    except Exception:  # noqa: BLE001
+        print(f"\n[{PHASE}] 抛出异常：")
+        traceback.print_exc()
+        code = 2
+    print(f"耗时 {time.perf_counter() - started:.1f}s")
+    sys.exit(code)

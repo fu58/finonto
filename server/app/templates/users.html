@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}用户与角色{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>用户与角色</h1>
+    <p class="muted">
+      四级角色：只读 &lt; 编辑 &lt; 审批 &lt; 管理员。权限在中间件（路径级）与接口（依赖级）各校验一次，
+      页面隐藏按钮只是体验优化，不作为安全边界。
+    </p>
+  </header>
+
+  {% if message %}
+  <div class="banner info">操作结果：<code>{{ message }}</code></div>
+  {% endif %}
+
+  <div class="stat-grid">
+    <div class="stat"><span>用户数</span><strong>{{ users|length }}</strong></div>
+    <div class="stat"><span>活跃会话</span><strong>{{ session_stats.active }}</strong></div>
+    <div class="stat"><span>会话总数</span><strong>{{ session_stats.total }}</strong></div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+      <tr><th>用户</th><th>角色</th><th>状态</th><th>最近登录</th><th>失败次数</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+      {% for item in users %}
+      <tr>
+        <td>
+          <strong>{{ item.username }}</strong>
+          <div class="muted small">{{ item.display_name or '—' }}</div>
+          {% if item.must_change_password %}<span class="badge warn">待改初始密码</span>{% endif %}
+        </td>
+        <td>
+          <form method="post" action="/users/{{ item.id }}/update" class="inline-form">
+            <select name="role">
+              {% for role in roles %}
+              <option value="{{ role.key }}" {% if item.role == role.key %}selected{% endif %}>{{ role.label }}</option>
+              {% endfor %}
+            </select>
+            <button class="btn tiny" type="submit">保存</button>
+          </form>
+        </td>
+        <td>
+          <form method="post" action="/users/{{ item.id }}/update" class="inline-form">
+            <input type="hidden" name="is_active" value="{{ '0' if item.is_active else '1' }}"/>
+            <button class="btn tiny {{ 'danger' if item.is_active else 'primary' }}" type="submit">
+              {{ '停用' if item.is_active else '启用' }}
+            </button>
+          </form>
+          <span class="badge {{ 'ok' if item.is_active else 'err' }}">{{ '启用' if item.is_active else '停用' }}</span>
+        </td>
+        <td class="muted small">{{ item.last_login_at or '从未登录' }}</td>
+        <td class="muted small">{{ item.failed_attempts }}{% if item.locked_until %}<br/>锁定至 {{ item.locked_until }}{% endif %}</td>
+        <td class="row-meta">
+          <form method="post" action="/users/{{ item.id }}/reset" class="inline-form"
+                data-confirm="重置 {{ item.username }} 的密码？其所有会话会被强制下线。">
+            <input name="password" placeholder="新密码（≥8 位）" size="14" required/>
+            <button class="btn tiny" type="submit">重置密码</button>
+          </form>
+          <form method="post" action="/users/{{ item.id }}/delete"
+                data-confirm="删除用户 {{ item.username }}？">
+            <button class="btn tiny danger" type="submit">删除</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<div class="split">
+  <section class="panel">
+    <header class="panel-head"><h2>新建用户</h2></header>
+    <form method="post" action="/users/create" class="stack">
+      <div class="form-grid">
+        <label>用户名 <input name="username" required autocomplete="off"/></label>
+        <label>显示名 <input name="display_name" placeholder="例如：张工（设备部）"/></label>
+      </div>
+      <div class="form-grid">
+        <label>初始密码 <input name="password" type="password" required placeholder="≥8 位，非纯数字"/></label>
+        <label>角色
+          <select name="role">
+            {% for role in roles %}
+            <option value="{{ role.key }}" {% if role.key == 'viewer' %}selected{% endif %}>{{ role.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <div class="ask-actions"><button class="btn primary" type="submit">创建</button>
+        <span class="muted small">新用户首次登录会被要求改密</span></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <header class="panel-head"><h2>角色说明</h2></header>
+    <div class="list compact">
+      {% for role in roles %}
+      <div class="row">
+        <div class="row-main">
+          <strong>L{{ role.level }} {{ role.label }}</strong>
+          <span class="muted small">{{ role.description }}</span>
+        </div>
+        <div class="row-meta"><code class="small">{{ role.key }}</code></div>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}

@@ -1,169 +1,198 @@
-"""知识库文档：上传解析、分块预览、列表、删除、重新索引。"""
+"""文档入库接口。
+
+上传走 **原始请求体**（`application/octet-stream`）+ query 参数传文件名：
+这样既不需要 python-multipart，前端也只需要一行 ``fetch(url, {body: file})``。
+需要 multipart 的调用方（curl -F）由页面层的表单处理器兜底（见 web/pages.py）。
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..core.rag.ingest import IngestService, namespace_for
-from ..db import get_session
-from ..models import Chunk, DocumentRecord
-from ..providers.registry import registry
+from ..config import get_settings
+from ..core.rag.ingest import (
+    delete_document,
+    ingest_bytes,
+    ingest_text,
+    rebuild_document_index,
+    rebuild_space_index,
+)
+from ..db import get_db
+from ..models import Document, DocumentChunk, OntologySpace
+from ..providers.registry import get_components
 
-router = APIRouter(prefix="/api/documents", tags=["documents"])
-
-
-def _doc_view(doc: DocumentRecord, chunk_count: int) -> dict[str, Any]:
-    return {
-        "id": doc.id,
-        "space_id": doc.space_id,
-        "name": doc.name,
-        "doc_type": doc.doc_type,
-        "doc_format": doc.doc_format,
-        "media_type": doc.media_type,
-        "issuer": doc.issuer,
-        "jurisdiction": doc.jurisdiction,
-        "effective_date": doc.effective_date,
-        "authority": doc.authority,
-        "status": doc.status,
-        "error": doc.error,
-        "char_count": doc.char_count,
-        "chunks": chunk_count,
-        "storage_key": doc.storage_key,
-        "source_uri": doc.source_uri,
-        "created_at": doc.created_at.isoformat() if doc.created_at else "",
-        "meta": doc.meta,
-    }
+router = APIRouter(prefix="/api", tags=["documents"])
 
 
-@router.get("")
+@router.get("/documents")
 def list_documents(
-    session: Session = Depends(get_session), space_id: int | None = None, limit: int = 200
+    space_id: int = Query(..., alias="space"),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    stmt = select(DocumentRecord).order_by(DocumentRecord.id.desc()).limit(limit)
-    if space_id:
-        stmt = stmt.where(DocumentRecord.space_id == space_id)
-    docs = list(session.scalars(stmt).all())
-    counts = dict(
-        session.execute(select(Chunk.doc_id, func.count()).group_by(Chunk.doc_id)).all()
-    )
+    rows = db.execute(
+        select(Document).where(Document.space_id == space_id).order_by(Document.id.desc())
+    ).scalars().all()
+    result = []
+    for row in rows:
+        chunk_count = int(
+            db.execute(
+                select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == row.id)
+            ).scalar_one()
+        )
+        result.append(
+            {
+                "id": row.id,
+                "title": row.title,
+                "filename": row.filename,
+                "mime": row.mime,
+                "doc_type": row.doc_type,
+                "issuer": row.issuer,
+                "jurisdiction": row.jurisdiction,
+                "authority": row.authority,
+                "size_bytes": row.size_bytes,
+                "page_count": row.page_count,
+                "chunks": chunk_count,
+                "status": row.status,
+                "created_at": row.created_at.isoformat(sep=" ", timespec="seconds"),
+            }
+        )
+    return {"documents": result, "count": len(result)}
+
+
+@router.get("/documents/{document_id}/chunks")
+def chunks(document_id: int, limit: int = Query(200), db: Session = Depends(get_db)) -> dict[str, Any]:
+    rows = db.execute(
+        select(DocumentChunk)
+        .where(DocumentChunk.document_id == document_id)
+        .order_by(DocumentChunk.ordinal)
+        .limit(limit)
+    ).scalars().all()
     return {
-        "documents": [_doc_view(doc, counts.get(doc.id, 0)) for doc in docs],
-        "formats": registry.doc_parser().formats,
-        "total_chunks": sum(counts.values()),
+        "chunks": [
+            {"id": row.id, "ordinal": row.ordinal, "locator": row.locator,
+             "tokens": row.token_count, "text": row.text}
+            for row in rows
+        ]
     }
 
 
-@router.post("/upload")
-async def upload_document(
-    file: UploadFile = File(...),
-    space_id: int = Form(...),
-    doc_type: str = Form(""),
-    issuer: str = Form(""),
-    jurisdiction: str = Form(""),
-    effective_date: str = Form(""),
-    authority: float = Form(0.6),
-    session: Session = Depends(get_session),
+@router.post("/documents/upload")
+async def upload(
+    request: Request,
+    space_id: int = Query(..., alias="space"),
+    filename: str = Query(...),
+    title: str = Query(""),
+    doc_type: str = Query("制度"),
+    issuer: str = Query(""),
+    jurisdiction: str = Query(""),
+    authority: int = Query(3),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    payload = await file.read()
-    if not payload:
-        raise HTTPException(400, "文件内容为空")
-    report = IngestService(session).ingest_bytes(
-        name=file.filename or "untitled",
-        payload=payload,
-        space_id=space_id,
-        doc_format="",
-        media_type=file.content_type or "",
+    settings = get_settings()
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="请求体为空")
+    if len(data) > settings.max_upload_mb * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"文件超过 {settings.max_upload_mb}MB 上限")
+    if db.get(OntologySpace, space_id) is None:
+        raise HTTPException(status_code=404, detail="空间不存在")
+
+    result = ingest_bytes(
+        db,
+        space_id,
+        filename,
+        data,
+        components=get_components(),
+        title=title or filename,
         doc_type=doc_type,
         issuer=issuer,
         jurisdiction=jurisdiction,
-        effective_date=effective_date,
         authority=authority,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
     )
-    session.commit()
-    doc = session.get(DocumentRecord, report.doc_id)
-    return {
-        "report": report.__dict__,
-        "document": _doc_view(doc, report.chunks) if doc else None,
-    }
+    return result.as_dict()
 
 
-@router.post("/text")
-def ingest_text(body: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
-    text = str(body.get("text", ""))
-    if not text.strip():
-        raise HTTPException(400, "text 不能为空")
-    report = IngestService(session).ingest_bytes(
-        name=str(body.get("name", "inline.md")),
-        payload=text.encode("utf-8"),
-        space_id=int(body.get("space_id", 1)),
-        doc_format=str(body.get("doc_format", "md")),
-        doc_type=str(body.get("doc_type", "手工录入")),
-        authority=float(body.get("authority", 0.5)),
+@router.post("/documents/text")
+def upload_text(
+    space_id: int = Query(..., alias="space"),
+    title: str = Query("未命名片段"),
+    content: str = Query(""),
+    doc_type: str = Query("制度"),
+    authority: int = Query(3),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="content 不能为空")
+    settings = get_settings()
+    result = ingest_text(
+        db,
+        space_id,
+        content,
+        components=get_components(),
+        title=title,
+        doc_type=doc_type,
+        authority=authority,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
     )
-    session.commit()
-    doc = session.get(DocumentRecord, report.doc_id)
-    return {
-        "report": report.__dict__,
-        "document": _doc_view(doc, report.chunks) if doc else None,
-    }
+    return result.as_dict()
 
 
-@router.get("/{doc_id}/chunks")
-def list_chunks(doc_id: int, session: Session = Depends(get_session), limit: int = 200) -> dict[str, Any]:
-    rows = list(
-        session.scalars(
-            select(Chunk).where(Chunk.doc_id == doc_id).order_by(Chunk.ordinal).limit(limit)
-        ).all()
+@router.post("/documents/{document_id}/reindex")
+def reindex(document_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    result = rebuild_document_index(db, document_id, components=get_components())
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="文档不存在")
+    return result
+
+
+@router.post("/documents/reindex")
+def reindex_space(space_id: int = Query(..., alias="space"), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return rebuild_space_index(db, space_id, components=get_components())
+
+
+@router.delete("/documents/{document_id}")
+def remove(document_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return delete_document(db, document_id, components=get_components())
+
+
+@router.get("/objects/{key:path}")
+def get_object(key: str, db: Session = Depends(get_db)) -> Response:
+    components = get_components()
+    try:
+        data = components.object_store.get(key)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail="对象不存在")
+    return Response(content=data, media_type="application/octet-stream")
+
+
+@router.get("/documents/stats")
+def document_stats(space_id: int = Query(..., alias="space"), db: Session = Depends(get_db)) -> dict[str, Any]:
+    documents = int(
+        db.execute(select(func.count(Document.id)).where(Document.space_id == space_id)).scalar_one()
     )
-    doc = session.get(DocumentRecord, doc_id)
-    if doc is None:
-        raise HTTPException(404, "文档不存在")
+    chunks = int(
+        db.execute(
+            select(func.count(DocumentChunk.id))
+            .join(Document, Document.id == DocumentChunk.document_id)
+            .where(Document.space_id == space_id)
+        ).scalar_one()
+    )
+    chars = db.execute(
+        select(func.coalesce(func.sum(func.length(DocumentChunk.text)), 0))
+        .join(Document, Document.id == DocumentChunk.document_id)
+        .where(Document.space_id == space_id)
+    ).scalar_one()
     return {
-        "document": _doc_view(doc, len(rows)),
-        "chunks": [
-            {
-                "id": chunk.id,
-                "ordinal": chunk.ordinal,
-                "locator": chunk.locator,
-                "token_estimate": chunk.token_estimate,
-                "text": chunk.text,
-                "meta": chunk.meta,
-            }
-            for chunk in rows
-        ],
+        "documents": documents,
+        "chunks": chunks,
+        "chars": int(chars or 0),
+        "vectors": get_components().vector_store.stats(),
     }
-
-
-@router.post("/preview-chunks")
-def preview_chunks(body: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
-    """按当前分块参数预览切块结果，用于调 chunk_max_tokens 时不写入数据库。"""
-    text = str(body.get("text", ""))
-    if not text.strip():
-        raise HTTPException(400, "text 不能为空")
-    return {"chunks": IngestService(session).preview_chunks(text, max_tokens=body.get("max_tokens"))}
-
-
-@router.post("/{doc_id}/reindex")
-def reindex(doc_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
-    doc = session.get(DocumentRecord, doc_id)
-    if doc is None:
-        raise HTTPException(404, "文档不存在")
-    rows = list(session.scalars(select(Chunk).where(Chunk.doc_id == doc_id)).all())
-    embedded = IngestService(session).embed_and_index(rows, doc.space_id)
-    rebuilt = IngestService(session).rebuild_lexical_index(doc.space_id)
-    doc.status = "indexed" if rows else "empty"
-    session.commit()
-    return {"embedded": embedded, "lexical_documents": rebuilt, "namespace": namespace_for(doc.space_id)}
-
-
-@router.delete("/{doc_id}")
-def delete_document(doc_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
-    if session.get(DocumentRecord, doc_id) is None:
-        raise HTTPException(404, "文档不存在")
-    IngestService(session).delete_document(doc_id)
-    session.commit()
-    return {"deleted": doc_id}

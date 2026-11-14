@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}审计日志{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>审计日志</h1>
+    <p class="muted">
+      记录「谁、什么时候、对什么、做了什么、结果如何」。审计写入是旁路，永不阻断业务；
+      密钥类字段一律脱敏为 <code>***</code>。
+    </p>
+  </header>
+
+  <div class="stat-grid">
+    <div class="stat"><span>总记录</span><strong>{{ stats.total }}</strong></div>
+    <div class="stat"><span>近 24h</span><strong>{{ stats.recent }}</strong></div>
+    <div class="stat"><span>近 24h 失败/拒绝</span><strong>{{ stats.failures }}</strong></div>
+    <div class="stat"><span>当前筛选</span><strong>{{ logs|length }}</strong></div>
+  </div>
+
+  <form class="filter-row" method="get" action="/audit">
+    <input type="hidden" name="space" value="{{ space_id }}"/>
+    <select name="action">
+      <option value="">全部动作</option>
+      {% for action in actions %}
+      <option value="{{ action.key }}" {% if filters.action == action.key %}selected{% endif %}>{{ action.label }}</option>
+      {% endfor %}
+    </select>
+    <select name="actor">
+      <option value="">全部操作人</option>
+      {% for actor in actors %}
+      <option value="{{ actor }}" {% if filters.actor == actor %}selected{% endif %}>{{ actor }}</option>
+      {% endfor %}
+    </select>
+    <select name="status">
+      <option value="">全部结果</option>
+      <option value="ok" {% if filters.status == 'ok' %}selected{% endif %}>成功</option>
+      <option value="failed" {% if filters.status == 'failed' %}selected{% endif %}>失败</option>
+      <option value="denied" {% if filters.status == 'denied' %}selected{% endif %}>被拒绝</option>
+    </select>
+    <input type="search" name="keyword" value="{{ filters.keyword or '' }}" placeholder="对象或动作关键字"/>
+    <button class="btn" type="submit">筛选</button>
+    <a class="btn" href="/api/audit/export.csv">导出 CSV</a>
+  </form>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>最近 200 条</h2></header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+      <tr><th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>结果</th><th>IP</th><th>request-id</th><th>详情</th></tr>
+      </thead>
+      <tbody>
+      {% for item in logs %}
+      <tr>
+        <td class="muted small">{{ item.created_at }}</td>
+        <td>{{ item.actor }}{% if item.role %} <span class="badge ghost">{{ item.role }}</span>{% endif %}</td>
+        <td>{{ item.action_label }}</td>
+        <td class="muted small">{{ item.target or '—' }}</td>
+        <td><span class="badge {{ 'ok' if item.status == 'ok' else 'warn' if item.status == 'denied' else 'err' }}">{{ item.status_label }}</span></td>
+        <td class="muted small">{{ item.ip or '—' }}</td>
+        <td><code class="small">{{ item.request_id or '—' }}</code></td>
+        <td class="muted small">{{ item.detail | tojson }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="muted">没有符合条件的记录。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>保留策略</h2></header>
+  <p class="muted small">默认保留 180 天（<code>FINONTO_AUDIT_RETENTION_DAYS</code>）。清理动作本身也会被记录。</p>
+  <form class="filter-row" method="post" action="/ops/audit-purge"
+        data-confirm="确认清理过期审计记录？该操作不可恢复。">
+    <label class="inline">保留天数 <input type="number" name="days" value="180" min="1" max="3650" style="width:90px"/></label>
+    <button class="btn danger" type="submit">清理过期记录</button>
+  </form>
+</section>
+{% endblock %}

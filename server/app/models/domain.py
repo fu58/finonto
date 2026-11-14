@@ -1,8 +1,17 @@
-"""领域数据模型：本体空间、对象类型、属性、关系、约束、变更提案、文档、Agent、Wiki、记忆。"""
+"""领域模型：19 张业务表 + 1 张向量背书表。
+
+设计原则
+--------
+1. **一切按空间隔离**：类型、属性、关联、约束、提案、Wiki、图谱都挂 ``space_id``，
+   所以「加一个领域」不需要动任何表结构（见 docs/ARCHITECTURE.md「领域包」一节）。
+2. **结构只能通过提案改变**：``ObjectType``/``TypeLink``/``Constraint`` 没有对外的写接口，
+   唯一入口是 ``core.ontology.service.accept_proposal``。
+3. **版本不可变**：``WikiRevision`` 只追加不修改；回滚 = 追加一个新版本。
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from sqlalchemy import (
     JSON,
@@ -18,315 +27,380 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from ..db import Base
+from .base import Base, utcnow
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-class Space(Base):
-    """一个本体空间（ontology space），例如「零售信贷」「设备维保」「计算机网络」。
-
-    domain 存放所属领域包的 key，用于把词表、提示词与推理线索定位到正确的领域。
-    """
-
-    __tablename__ = "spaces"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(128), unique=True)
-    iri: Mapped[str] = mapped_column(String(256), default="")
-    domain: Mapped[str] = mapped_column(String(64), default="general", index=True)
-    description: Mapped[str] = mapped_column(Text, default="")
-    status: Mapped[str] = mapped_column(String(24), default="active")
+class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
-    object_types: Mapped[list[ObjectType]] = relationship(
-        back_populates="space", cascade="all, delete-orphan"
+
+# --------------------------------------------------------------------------- #
+# 1. 本体空间
+# --------------------------------------------------------------------------- #
+class OntologySpace(TimestampMixin, Base):
+    __tablename__ = "ontology_spaces"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    iri: Mapped[str] = mapped_column(String(300), unique=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    #: 领域包 key —— 「领域如何生效」的唯一挂载点
+    domain: Mapped[str] = mapped_column(String(60), index=True, default="general")
+    status: Mapped[str] = mapped_column(String(20), default="active")
+
+    object_types: Mapped[list["ObjectType"]] = relationship(
+        back_populates="space", cascade="all, delete-orphan", passive_deletes=True
     )
 
 
-class ObjectType(Base):
-    """OWL 风格 owl:Class —— 本体对象类型。"""
-
+# --------------------------------------------------------------------------- #
+# 2. 对象类型
+# --------------------------------------------------------------------------- #
+class ObjectType(TimestampMixin, Base):
     __tablename__ = "object_types"
-    __table_args__ = (UniqueConstraint("space_id", "iri", name="uq_object_type_iri"),)
+    __table_args__ = (UniqueConstraint("space_id", "label", name="uq_object_type_label"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int] = mapped_column(ForeignKey("spaces.id", ondelete="CASCADE"), index=True)
-    iri: Mapped[str] = mapped_column(String(256))
-    label: Mapped[str] = mapped_column(String(128), index=True)
-    label_en: Mapped[str] = mapped_column(String(128), default="")
-    plural_label: Mapped[str] = mapped_column(String(128), default="")
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
+    )
+    label: Mapped[str] = mapped_column(String(120))
+    label_en: Mapped[str] = mapped_column(String(160), default="")
     definition: Mapped[str] = mapped_column(Text, default="")
+    #: class / agreement / role / document / metric / event / organization / asset / process
+    kind: Mapped[str] = mapped_column(String(40), default="class")
+    is_abstract: Mapped[bool] = mapped_column(Boolean, default=False)
     parent_id: Mapped[int | None] = mapped_column(
-        ForeignKey("object_types.id", ondelete="SET NULL"), nullable=True, index=True
+        ForeignKey("object_types.id", ondelete="SET NULL"), nullable=True
     )
-    kind: Mapped[str] = mapped_column(String(32), default="class")
-    abstract: Mapped[bool] = mapped_column(Boolean, default=False)
-    status: Mapped[str] = mapped_column(String(24), default="draft")
-    confidence: Mapped[float] = mapped_column(Float, default=0.0)
-    origin: Mapped[str] = mapped_column(String(24), default="manual")
-    business_domain: Mapped[str] = mapped_column(String(64), default="", index=True)
-    tags: Mapped[list] = mapped_column(JSON, default=list)
+    business_domain: Mapped[str] = mapped_column(String(80), default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    #: pack / rag / agent / manual
+    source: Mapped[str] = mapped_column(String(20), default="manual")
+    status: Mapped[str] = mapped_column(String(20), default="active")
     aliases: Mapped[list] = mapped_column(JSON, default=list)
-    # 领域扩展注解：标准/条款引用、数据分级、风险维度、标识体系、生命周期等，取值随领域包变化
+    tags: Mapped[list] = mapped_column(JSON, default=list)
     annotations: Mapped[dict] = mapped_column(JSON, default=dict)
-    version_no: Mapped[int] = mapped_column(Integer, default=1)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    iri: Mapped[str] = mapped_column(String(300), unique=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
 
-    space: Mapped[Space] = relationship(back_populates="object_types")
-    data_props: Mapped[list["TypeDataProperty"]] = relationship(
-        back_populates="object_type", cascade="all, delete-orphan"
+    space: Mapped[OntologySpace] = relationship(back_populates="object_types")
+    parent: Mapped["ObjectType | None"] = relationship(remote_side="ObjectType.id")
+
+
+# --------------------------------------------------------------------------- #
+# 3-4. 数据属性与「类型 ↔ 属性」绑定
+# --------------------------------------------------------------------------- #
+class DataPropertyDef(TimestampMixin, Base):
+    __tablename__ = "data_properties"
+    __table_args__ = (UniqueConstraint("space_id", "key", name="uq_data_property_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
     )
-
-    @property
-    def name(self) -> str:
-        return self.label
-
-
-class DataPropertyDef(Base):
-    """owl:DatatypeProperty —— 可复用的数据类型定义。"""
-
-    __tablename__ = "data_property_defs"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int] = mapped_column(ForeignKey("spaces.id", ondelete="CASCADE"), index=True)
-    iri: Mapped[str] = mapped_column(String(256))
-    label: Mapped[str] = mapped_column(String(128))
-    datatype: Mapped[str] = mapped_column(String(32), default="string")
-    unit: Mapped[str] = mapped_column(String(32), default="")
-    pattern: Mapped[str] = mapped_column(String(256), default="")
+    key: Mapped[str] = mapped_column(String(120))
+    label: Mapped[str] = mapped_column(String(120))
+    #: string / integer / decimal / boolean / date / datetime / uri / enum
+    data_type: Mapped[str] = mapped_column(String(20), default="string")
+    unit: Mapped[str] = mapped_column(String(40), default="")
+    is_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    enum_values: Mapped[list] = mapped_column(JSON, default=list)
     description: Mapped[str] = mapped_column(Text, default="")
-    enum_id: Mapped[int | None] = mapped_column(ForeignKey("enumerations.id", ondelete="SET NULL"))
-    format_ref: Mapped[str] = mapped_column(String(64), default="")
-    annotations: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
-class TypeDataProperty(Base):
-    """对象类型上的数据属性槽位（domain 绑定）。"""
-
+class TypeDataProperty(TimestampMixin, Base):
     __tablename__ = "type_data_properties"
-    __table_args__ = (UniqueConstraint("object_type_id", "property_id", name="uq_type_dataprop"),)
+    __table_args__ = (UniqueConstraint("type_id", "property_id", name="uq_type_prop"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    object_type_id: Mapped[int] = mapped_column(
+    type_id: Mapped[int] = mapped_column(
         ForeignKey("object_types.id", ondelete="CASCADE"), index=True
     )
     property_id: Mapped[int] = mapped_column(
-        ForeignKey("data_property_defs.id", ondelete="CASCADE"), index=True
+        ForeignKey("data_properties.id", ondelete="CASCADE"), index=True
     )
-    required: Mapped[bool] = mapped_column(Boolean, default=False)
-    unique_flag: Mapped[bool] = mapped_column(Boolean, default=False)
-    min_card: Mapped[int] = mapped_column(Integer, default=0)
-    max_card: Mapped[int] = mapped_column(Integer, default=1)
-    description: Mapped[str] = mapped_column(Text, default="")
-    key_identifier: Mapped[bool] = mapped_column(Boolean, default=False)
-    annotations: Mapped[dict] = mapped_column(JSON, default=dict)
-
-    object_type: Mapped[ObjectType] = relationship(back_populates="data_props")
-    property: Mapped[DataPropertyDef] = relationship()
+    is_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    ordinal: Mapped[int] = mapped_column(Integer, default=0)
+    note: Mapped[str] = mapped_column(Text, default="")
 
 
-class RelationType(Base):
-    """owl:ObjectProperty —— 对象类型之间的关联语义。"""
-
+# --------------------------------------------------------------------------- #
+# 5-6. 关联类型与类型间连线
+# --------------------------------------------------------------------------- #
+class RelationType(TimestampMixin, Base):
     __tablename__ = "relation_types"
+    __table_args__ = (UniqueConstraint("space_id", "key", name="uq_relation_key"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int] = mapped_column(ForeignKey("spaces.id", ondelete="CASCADE"), index=True)
-    iri: Mapped[str] = mapped_column(String(256))
-    label: Mapped[str] = mapped_column(String(128))
-    label_en: Mapped[str] = mapped_column(String(128), default="")
-    inverse_iri: Mapped[str] = mapped_column(String(256), default="")
-    symmetric: Mapped[bool] = mapped_column(Boolean, default=False)
-    transitive: Mapped[bool] = mapped_column(Boolean, default=False)
-    functional: Mapped[bool] = mapped_column(Boolean, default=False)
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
+    )
+    key: Mapped[str] = mapped_column(String(120))
+    label: Mapped[str] = mapped_column(String(120))
+    #: taxonomy / participant / reference / derivation / regulatory / part_of / causal
+    category: Mapped[str] = mapped_column(String(40), default="reference")
+    inverse_key: Mapped[str] = mapped_column(String(120), default="")
     description: Mapped[str] = mapped_column(Text, default="")
-    category: Mapped[str] = mapped_column(String(32), default="association")
-    annotations: Mapped[dict] = mapped_column(JSON, default=dict)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-class TypeLink(Base):
-    """被断言的关联（RelationType 在两个具体对象类型上的实例化）= 知识图谱的边。"""
-
+class TypeLink(TimestampMixin, Base):
     __tablename__ = "type_links"
     __table_args__ = (
-        UniqueConstraint("source_id", "relation_id", "target_id", name="uq_type_link"),
+        UniqueConstraint("source_type_id", "target_type_id", "relation_id", name="uq_type_link"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int] = mapped_column(ForeignKey("spaces.id", ondelete="CASCADE"), index=True)
-    source_id: Mapped[int] = mapped_column(
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
+    )
+    source_type_id: Mapped[int] = mapped_column(
         ForeignKey("object_types.id", ondelete="CASCADE"), index=True
     )
-    target_id: Mapped[int] = mapped_column(
+    target_type_id: Mapped[int] = mapped_column(
         ForeignKey("object_types.id", ondelete="CASCADE"), index=True
     )
-    relation_id: Mapped[int] = mapped_column(ForeignKey("relation_types.id", ondelete="CASCADE"))
-    cardinality: Mapped[str] = mapped_column(String(16), default="n:m")
-    description: Mapped[str] = mapped_column(Text, default="")
-    origin: Mapped[str] = mapped_column(String(24), default="manual")
-    confidence: Mapped[float] = mapped_column(Float, default=0.0)
-    status: Mapped[str] = mapped_column(String(24), default="active")
-    annotations: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-
-    source: Mapped[ObjectType] = relationship(foreign_keys=[source_id])
-    target: Mapped[ObjectType] = relationship(foreign_keys=[target_id])
-    relation: Mapped[RelationType] = relationship()
+    relation_id: Mapped[int] = mapped_column(
+        ForeignKey("relation_types.id", ondelete="CASCADE"), index=True
+    )
+    cardinality: Mapped[str] = mapped_column(String(20), default="1..*")
+    label: Mapped[str] = mapped_column(String(160), default="")
+    note: Mapped[str] = mapped_column(Text, default="")
 
 
-class Enumeration(Base):
-    __tablename__ = "enumerations"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int] = mapped_column(ForeignKey("spaces.id", ondelete="CASCADE"), index=True)
-    iri: Mapped[str] = mapped_column(String(256))
-    label: Mapped[str] = mapped_column(String(128))
-    members: Mapped[list] = mapped_column(JSON, default=list)
-    description: Mapped[str] = mapped_column(Text, default="")
-
-
-class Constraint(Base):
-    """SHACL 风格约束，用于表达合规义务、SLA 与运维阈值等硬性规则。"""
-
+# --------------------------------------------------------------------------- #
+# 7. SHACL 风格约束
+# --------------------------------------------------------------------------- #
+class Constraint(TimestampMixin, Base):
     __tablename__ = "constraints"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int] = mapped_column(ForeignKey("spaces.id", ondelete="CASCADE"), index=True)
-    name: Mapped[str] = mapped_column(String(160))
-    subject_type_id: Mapped[int | None] = mapped_column(
-        ForeignKey("object_types.id", ondelete="CASCADE"), nullable=True, index=True
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
     )
-    subject_property_iri: Mapped[str] = mapped_column(String(256), default="")
-    kind: Mapped[str] = mapped_column(String(32), default="range")
+    type_id: Mapped[int] = mapped_column(
+        ForeignKey("object_types.id", ondelete="CASCADE"), index=True
+    )
+    property_id: Mapped[int | None] = mapped_column(
+        ForeignKey("data_properties.id", ondelete="SET NULL"), nullable=True
+    )
+    #: range / codependency / cardinality
+    kind: Mapped[str] = mapped_column(String(30), default="range")
+    #: violation / warning / info
+    severity: Mapped[str] = mapped_column(String(20), default="violation")
     expression: Mapped[str] = mapped_column(Text, default="")
-    severity: Mapped[str] = mapped_column(String(16), default="violation")
-    reg_ref: Mapped[str] = mapped_column(String(160), default="")
-    description: Mapped[str] = mapped_column(Text, default="")
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
-    annotations: Mapped[dict] = mapped_column(JSON, default=dict)
+    message: Mapped[str] = mapped_column(Text, default="")
+    regulation_ref: Mapped[str] = mapped_column(String(160), default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
-class DocumentRecord(Base):
-    __tablename__ = "documents"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int | None] = mapped_column(ForeignKey("spaces.id", ondelete="SET NULL"))
-    name: Mapped[str] = mapped_column(String(256))
-    source_uri: Mapped[str] = mapped_column(String(512), default="")
-    storage_key: Mapped[str] = mapped_column(String(512), default="")
-    media_type: Mapped[str] = mapped_column(String(96), default="")
-    doc_format: Mapped[str] = mapped_column(String(32), default="txt")
-    doc_type: Mapped[str] = mapped_column(String(48), default="")
-    jurisdiction: Mapped[str] = mapped_column(String(32), default="")
-    issuer: Mapped[str] = mapped_column(String(128), default="")
-    effective_date: Mapped[str] = mapped_column(String(32), default="")
-    authority: Mapped[float] = mapped_column(Float, default=0.5)
-    status: Mapped[str] = mapped_column(String(24), default="pending")
-    error: Mapped[str] = mapped_column(Text, default="")
-    char_count: Mapped[int] = mapped_column(Integer, default=0)
-    meta: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-
-    chunks: Mapped[list["Chunk"]] = relationship(
-        back_populates="document", cascade="all, delete-orphan"
-    )
-
-
-class Chunk(Base):
-    __tablename__ = "chunks"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    doc_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
-    space_id: Mapped[int | None] = mapped_column(Integer, index=True)
-    ordinal: Mapped[int] = mapped_column(Integer, default=0)
-    text: Mapped[str] = mapped_column(Text)
-    locator: Mapped[str] = mapped_column(String(64), default="")
-    token_estimate: Mapped[int] = mapped_column(Integer, default=0)
-    meta: Mapped[dict] = mapped_column(JSON, default=dict)
-    vector: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
-    vector_model: Mapped[str] = mapped_column(String(64), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-
-    document: Mapped[DocumentRecord] = relationship(back_populates="chunks")
-
-
-class ChangeProposal(Base):
-    """Agent / 问答生成的本体变更草稿，等待人工确认后才落库。"""
-
-    __tablename__ = "change_proposals"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int] = mapped_column(ForeignKey("spaces.id", ondelete="CASCADE"), index=True)
-    run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id", ondelete="SET NULL"))
-    kind: Mapped[str] = mapped_column(String(32), default="object_type")
-    title: Mapped[str] = mapped_column(String(256), default="")
-    payload: Mapped[dict] = mapped_column(JSON, default=dict)
-    rationale: Mapped[str] = mapped_column(Text, default="")
-    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
-    confidence: Mapped[float] = mapped_column(Float, default=0.0)
-    review_note: Mapped[str] = mapped_column(Text, default="")
-    applied_ref: Mapped[str] = mapped_column(String(128), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-
-    evidences: Mapped[list["Evidence"]] = relationship(
-        back_populates="proposal", cascade="all, delete-orphan"
-    )
-
-
-class Evidence(Base):
-    """证据链：提案字段 -> 文档 chunk 的原文引用。"""
-
+# --------------------------------------------------------------------------- #
+# 8. 证据链
+# --------------------------------------------------------------------------- #
+class Evidence(TimestampMixin, Base):
     __tablename__ = "evidence"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    proposal_id: Mapped[int | None] = mapped_column(
-        ForeignKey("change_proposals.id", ondelete="CASCADE"), index=True
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
     )
-    answer_id: Mapped[str] = mapped_column(String(64), default="", index=True)
-    chunk_id: Mapped[int | None] = mapped_column(ForeignKey("chunks.id", ondelete="SET NULL"))
-    doc_id: Mapped[int | None] = mapped_column(Integer)
-    locator: Mapped[str] = mapped_column(String(64), default="")
+    proposal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("change_proposals.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    document_id: Mapped[int | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    chunk_id: Mapped[int | None] = mapped_column(
+        ForeignKey("document_chunks.id", ondelete="SET NULL"), nullable=True
+    )
+    #: 「文档 §3.2 第 2 段」这类人类可读定位
+    locator: Mapped[str] = mapped_column(String(300), default="")
     quote: Mapped[str] = mapped_column(Text, default="")
-    field_path: Mapped[str] = mapped_column(String(128), default="")
-    score: Mapped[float] = mapped_column(Float, default=0.0)
+    note: Mapped[str] = mapped_column(Text, default="")
 
-    proposal: Mapped["ChangeProposal | None"] = relationship(back_populates="evidences")
-    chunk: Mapped["Chunk | None"] = relationship()
+    proposal: Mapped["ChangeProposal | None"] = relationship(back_populates="evidence")
 
 
-class AgentSession(Base):
-    __tablename__ = "agent_sessions"
+# --------------------------------------------------------------------------- #
+# 9. 变更提案（人工确认闸门）
+# --------------------------------------------------------------------------- #
+class ChangeProposal(TimestampMixin, Base):
+    __tablename__ = "change_proposals"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int | None] = mapped_column(ForeignKey("spaces.id", ondelete="SET NULL"))
-    title: Mapped[str] = mapped_column(String(256), default="")
-    skill: Mapped[str] = mapped_column(String(64), default="")
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
+    )
+    #: create_type / update_type / create_link / create_constraint / update_property
+    action: Mapped[str] = mapped_column(String(40), default="create_type")
+    target_type_id: Mapped[int | None] = mapped_column(
+        ForeignKey("object_types.id", ondelete="SET NULL"), nullable=True
+    )
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    #: pending / accepted / rejected
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    #: rag / agent / manual
+    author: Mapped[str] = mapped_column(String(20), default="rag")
+    agent_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    decided_by: Mapped[str] = mapped_column(String(60), default="")
+    decision_comment: Mapped[str] = mapped_column(Text, default="")
+
+    evidence: Mapped[list["Evidence"]] = relationship(
+        back_populates="proposal", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 10-11. 文档与片段
+# --------------------------------------------------------------------------- #
+class Document(TimestampMixin, Base):
+    __tablename__ = "documents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(300))
+    filename: Mapped[str] = mapped_column(String(300), default="")
+    mime: Mapped[str] = mapped_column(String(120), default="")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String(64), default="", index=True)
+    language: Mapped[str] = mapped_column(String(20), default="zh")
+    #: 文种：制度 / 标准 / 合同 / 手册 / 论文 / 规程
+    doc_type: Mapped[str] = mapped_column(String(40), default="制度")
+    issuer: Mapped[str] = mapped_column(String(160), default="")
+    jurisdiction: Mapped[str] = mapped_column(String(80), default="")
+    #: 权威度 1-5，检索时的结构化过滤维度
+    authority: Mapped[int] = mapped_column(Integer, default=3)
+    source_uri: Mapped[str] = mapped_column(String(500), default="")
+    object_key: Mapped[str] = mapped_column(String(300), default="")
+    page_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="indexed")
+
+    chunks: Mapped[list["DocumentChunk"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class DocumentChunk(TimestampMixin, Base):
+    __tablename__ = "document_chunks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, default=0)
+    text: Mapped[str] = mapped_column(Text)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    locator: Mapped[str] = mapped_column(String(300), default="")
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    document: Mapped[Document] = relationship(back_populates="chunks")
+
+
+class ChunkVector(Base):
+    """向量库背书表：``sqlite_numpy`` 实现把向量存成 float32 BLOB。"""
+
+    __tablename__ = "chunk_vectors"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chunk_id: Mapped[int] = mapped_column(
+        ForeignKey("document_chunks.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    dim: Mapped[int] = mapped_column(Integer, default=384)
+    model: Mapped[str] = mapped_column(String(120), default="local_hash")
+    vector: Mapped[bytes] = mapped_column(LargeBinary)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+# --------------------------------------------------------------------------- #
+# 12-13. Wiki 页面与版本链
+# --------------------------------------------------------------------------- #
+class WikiPage(TimestampMixin, Base):
+    __tablename__ = "wiki_pages"
+    __table_args__ = (UniqueConstraint("space_id", "slug", name="uq_wiki_slug"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
+    )
+    slug: Mapped[str] = mapped_column(String(200), index=True)
+    #: index / type / domain / relations / quality
+    page_type: Mapped[str] = mapped_column(String(30), default="type")
+    title: Mapped[str] = mapped_column(String(300))
+    body: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="published")
+    is_locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_dirty: Mapped[bool] = mapped_column(Boolean, default=False)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class WikiRevision(Base):
+    __tablename__ = "wiki_revisions"
+    __table_args__ = (UniqueConstraint("page_id", "version", name="uq_revision_version"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    page_id: Mapped[int] = mapped_column(
+        ForeignKey("wiki_pages.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(300), default="")
+    body: Mapped[str] = mapped_column(Text, default="")
+    #: 内容摘要，用于快速判断「有没有真变化」
+    digest: Mapped[str] = mapped_column(String(64), default="")
+    #: compiler / manual / rollback
+    author: Mapped[str] = mapped_column(String(20), default="compiler")
+    message: Mapped[str] = mapped_column(String(300), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+# --------------------------------------------------------------------------- #
+# 14. 问答轨迹
+# --------------------------------------------------------------------------- #
+class QueryTrace(Base):
+    __tablename__ = "query_traces"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
+    )
+    question: Mapped[str] = mapped_column(Text)
+    intent: Mapped[str] = mapped_column(String(40), default="general")
+    sub_questions: Mapped[list] = mapped_column(JSON, default=list)
+    filters: Mapped[dict] = mapped_column(JSON, default=dict)
+    retrieved: Mapped[list] = mapped_column(JSON, default=list)
+    answer: Mapped[str] = mapped_column(Text, default="")
+    citations: Mapped[list] = mapped_column(JSON, default=list)
+    provider: Mapped[str] = mapped_column(String(80), default="mock")
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+# --------------------------------------------------------------------------- #
+# 15-16. Agent 运行与步骤
+# --------------------------------------------------------------------------- #
 class AgentRun(Base):
     __tablename__ = "agent_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    session_id: Mapped[int | None] = mapped_column(
-        ForeignKey("agent_sessions.id", ondelete="SET NULL")
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
     )
-    space_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    skill: Mapped[str] = mapped_column(String(60), default="doc-extraction")
     goal: Mapped[str] = mapped_column(Text, default="")
-    mode: Mapped[str] = mapped_column(String(24), default="react")
-    status: Mapped[str] = mapped_column(String(24), default="running", index=True)
-    final_answer: Mapped[str] = mapped_column(Text, default="")
-    steps_used: Mapped[int] = mapped_column(Integer, default=0)
-    tokens_used: Mapped[int] = mapped_column(Integer, default=0)
+    #: running / succeeded / failed / budget_exceeded
+    status: Mapped[str] = mapped_column(String(30), default="running")
+    step_count: Mapped[int] = mapped_column(Integer, default=0)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    conclusion: Mapped[str] = mapped_column(Text, default="")
+    proposal_ids: Mapped[list] = mapped_column(JSON, default=list)
     error: Mapped[str] = mapped_column(Text, default="")
-    summary: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
@@ -337,82 +411,151 @@ class AgentStep(Base):
     run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True)
     ordinal: Mapped[int] = mapped_column(Integer, default=0)
     thought: Mapped[str] = mapped_column(Text, default="")
-    action: Mapped[str] = mapped_column(String(128), default="")
+    action: Mapped[str] = mapped_column(String(80), default="")
     action_input: Mapped[dict] = mapped_column(JSON, default=dict)
-    observation: Mapped[str] = mapped_column(Text, default="")
-    status: Mapped[str] = mapped_column(String(24), default="ok")
-    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    observation: Mapped[dict] = mapped_column(JSON, default=dict)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
 
 
-class MemoryItem(Base):
-    """长期记忆：跨会话可召回的事实/偏好/模式/决策。"""
-
-    __tablename__ = "memory_items"
+# --------------------------------------------------------------------------- #
+# 17. 长期记忆
+# --------------------------------------------------------------------------- #
+class Memory(Base):
+    __tablename__ = "memories"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    scope: Mapped[str] = mapped_column(String(64), default="global", index=True)
-    kind: Mapped[str] = mapped_column(String(24), default="fact")
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
+    )
+    #: fact / preference / insight
+    kind: Mapped[str] = mapped_column(String(20), default="fact")
     content: Mapped[str] = mapped_column(Text)
-    keywords: Mapped[list] = mapped_column(JSON, default=list)
-    salience: Mapped[float] = mapped_column(Float, default=1.0)
-    use_count: Mapped[int] = mapped_column(Integer, default=0)
-    vector: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
-    source_run_id: Mapped[int | None] = mapped_column(Integer)
+    keywords: Mapped[str] = mapped_column(String(300), default="")
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    hits: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-class WikiPage(Base):
-    __tablename__ = "wiki_pages"
+# --------------------------------------------------------------------------- #
+# 18. MCP 服务登记
+# --------------------------------------------------------------------------- #
+class MCPServer(Base):
+    __tablename__ = "mcp_servers"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    space_id: Mapped[int] = mapped_column(ForeignKey("spaces.id", ondelete="CASCADE"), index=True)
-    slug: Mapped[str] = mapped_column(String(191), index=True)
-    title: Mapped[str] = mapped_column(String(256), default="")
-    page_type: Mapped[str] = mapped_column(String(32), default="auto")
-    object_type_id: Mapped[int | None] = mapped_column(
-        ForeignKey("object_types.id", ondelete="SET NULL"), nullable=True
-    )
-    current_version: Mapped[int] = mapped_column(Integer, default=0)
-    locked_by_human: Mapped[bool] = mapped_column(Boolean, default=False)
-    dirty: Mapped[bool] = mapped_column(Boolean, default=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
-
-    revisions: Mapped[list["WikiRevision"]] = relationship(
-        back_populates="page", cascade="all, delete-orphan", order_by="WikiRevision.version_no"
-    )
-
-
-class WikiRevision(Base):
-    __tablename__ = "wiki_revisions"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    page_id: Mapped[int] = mapped_column(ForeignKey("wiki_pages.id", ondelete="CASCADE"), index=True)
-    version_no: Mapped[int] = mapped_column(Integer, default=1)
-    body_md: Mapped[str] = mapped_column(Text, default="")
-    summary: Mapped[str] = mapped_column(Text, default="")
-    author: Mapped[str] = mapped_column(String(64), default="system")
-    change_note: Mapped[str] = mapped_column(String(512), default="")
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    #: inproc / stdio / http
+    transport: Mapped[str] = mapped_column(String(20), default="inproc")
+    command: Mapped[str] = mapped_column(String(300), default="")
+    url: Mapped[str] = mapped_column(String(300), default="")
+    tools: Mapped[list] = mapped_column(JSON, default=list)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
-    page: Mapped[WikiPage] = relationship(back_populates="revisions")
 
-
-class QueryTrace(Base):
-    """一次 RAG 问答的完整可观测记录。"""
-
-    __tablename__ = "query_traces"
+# --------------------------------------------------------------------------- #
+# 19. 沙箱运行记录
+# --------------------------------------------------------------------------- #
+class SandboxRun(Base):
+    __tablename__ = "sandbox_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    answer_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    space_id: Mapped[int | None] = mapped_column(Integer, index=True)
-    question: Mapped[str] = mapped_column(Text)
-    understood: Mapped[dict] = mapped_column(JSON, default=dict)
-    retrieval: Mapped[list] = mapped_column(JSON, default=list)
-    rerank: Mapped[list] = mapped_column(JSON, default=list)
-    answer: Mapped[str] = mapped_column(Text, default="")
-    citations: Mapped[list] = mapped_column(JSON, default=list)
-    coverage: Mapped[float] = mapped_column(Float, default=0.0)
+    space_id: Mapped[int] = mapped_column(
+        ForeignKey("ontology_spaces.id", ondelete="CASCADE"), index=True
+    )
+    code: Mapped[str] = mapped_column(Text, default="")
+    ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    stdout: Mapped[str] = mapped_column(Text, default="")
+    stderr: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
     elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+# --------------------------------------------------------------------------- #
+# 20. 账号与会话（企业落地：认证 / 授权 / 会话吊销）
+# --------------------------------------------------------------------------- #
+class User(TimestampMixin, Base):
+    """用户与角色。角色只有四级，够用且好解释（见 security.ROLE_LEVELS）。"""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(80), default="")
+    password_hash: Mapped[str] = mapped_column(String(300))
+    #: viewer / editor / approver / admin
+    role: Mapped[str] = mapped_column(String(20), default="viewer")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class SessionToken(Base):
+    """会话令牌：库里只存 SHA-256 指纹，明文只在登录响应里出现一次。"""
+
+    __tablename__ = "session_tokens"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ip: Mapped[str] = mapped_column(String(60), default="")
+    user_agent: Mapped[str] = mapped_column(String(200), default="")
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+# --------------------------------------------------------------------------- #
+# 21. 审计日志（谁、在什么时间、对什么、做了什么、结果如何）
+# --------------------------------------------------------------------------- #
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    actor: Mapped[str] = mapped_column(String(60), default="system", index=True)
+    role: Mapped[str] = mapped_column(String(20), default="")
+    #: login / logout / accept_proposal / create_type / edit_wiki / rollback / ingest / delete / activate_component / backup ...
+    action: Mapped[str] = mapped_column(String(60), index=True)
+    target: Mapped[str] = mapped_column(String(200), default="")
+    #: ok / denied / failed
+    status: Mapped[str] = mapped_column(String(20), default="ok", index=True)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    ip: Mapped[str] = mapped_column(String(60), default="")
+    user_agent: Mapped[str] = mapped_column(String(200), default="")
+    request_id: Mapped[str] = mapped_column(String(40), default="", index=True)
+
+
+__all__ = [
+    "Base",
+    "utcnow",
+    "OntologySpace",
+    "ObjectType",
+    "DataPropertyDef",
+    "TypeDataProperty",
+    "RelationType",
+    "TypeLink",
+    "Constraint",
+    "Evidence",
+    "ChangeProposal",
+    "Document",
+    "DocumentChunk",
+    "ChunkVector",
+    "WikiPage",
+    "WikiRevision",
+    "QueryTrace",
+    "AgentRun",
+    "AgentStep",
+    "Memory",
+    "MCPServer",
+    "SandboxRun",
+    "User",
+    "SessionToken",
+    "AuditLog",
+]

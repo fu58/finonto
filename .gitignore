@@ -1,17 +1,38 @@
+# 运行期数据（SQLite / 对象存储 / 上传件 / 沙箱 / 组件选择）
+server/var/
+server/var-*/
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
-node_modules/
-dist/
-*.tsbuildinfo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# 运行期数据（SQLite、对象存储、上传件、沙箱工作区、组件选择状态）
-server/var/
-client/var-dev.log
-data/finonto/
-data/pgdata/
-
-# 本地密钥
-.env
+# 本地配置与密钥
 server/.env
+.env
+*.pem
+*.key
+
+# 备份产物
+*.zip
+backups/
+
+# 测试与临时残留
+.tmp/
+_smoke_*.json
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

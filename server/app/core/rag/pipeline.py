@@ -1,228 +1,178 @@
-"""RAG 主链路编排：理解 -> 混合检索 -> 重排序 -> 流式生成 -> 可观测落库。"""
+"""RAG 主流程：查询理解 → 混合检索 → 重排 → 生成 → 引用绑定 → 轨迹落库。
+
+两个入口：
+* ``ask``        —— 一次性返回完整结果（同步接口、Agent 工具调用）；
+* ``ask_stream`` —— 逐 token 推送（SSE），事件类型见 SSE_EVENTS。
+
+注意 ``ask_stream`` 自己开 session：流式响应返回后请求级 session 已关闭，
+如果在生成器里继续用请求 session 会拿到已关闭的连接。
+"""
 
 from __future__ import annotations
 
 import time
-import uuid
-from collections.abc import AsyncIterator
-from typing import Any
+from typing import Iterator
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from ...db import session_scope
+from ...models import OntologySpace, QueryTrace
+from ...providers.base import RerankItem
+from ...providers.registry import get_components
+from ..ontology import packs
+from ..text import truncate
+from .citations import bind, normalize_tags
+from .generator import generate, generate_stream
+from .query_understanding import QueryPlan, understand
+from .retriever import retrieve
 
-from ...config import settings
-from ...models import ObjectType, QueryTrace
-from ...providers.base import WebResult
-from ...providers.registry import registry
-from ..ontology.packs import lexicon_for
-from .generator import stream_answer
-from .query_understanding import UnderstoodQuery, understand_async
-from .reranker import rerank
-from .retriever import Candidate, HybridRetriever
+SSE_EVENTS = ("plan", "retrieval", "token", "citations", "done", "error")
 
 
-class RagPipeline:
-    def __init__(self, session: Session) -> None:
-        self.session = session
-        self.retriever = HybridRetriever(session)
+def _domain_of(session, space_id: int) -> str:
+    space = session.get(OntologySpace, space_id)
+    return space.domain if space else "general"
 
-    # ------------------------------------------------------------ 组件
-    def known_types(self, space_id: int) -> list[tuple[int, str, str]]:
-        rows = self.session.scalars(
-            select(ObjectType).where(ObjectType.space_id == space_id)
-        ).all()
-        return [(r.id, r.label, r.definition or "") for r in rows]
 
-    async def prepare(
-        self,
-        question: str,
-        space_id: int,
-        *,
-        history: list[dict[str, str]] | None = None,
-        final_k: int | None = None,
-        rerank_provider: str | None = None,
-    ) -> tuple[UnderstoodQuery, list[Candidate], str, list[WebResult]]:
-        lexicon = lexicon_for(self.session, space_id)
-        understood = await understand_async(
-            question,
-            history=history,
-            known_types=self.known_types(space_id),
-            synonyms=lexicon["synonyms"],
-            extra_suffixes=lexicon["term_suffixes"],
-        )
-        candidates = self.retriever.search(
-            understood, space_id, candidate_k=settings.rag_candidate_k * 2, final_k=settings.rag_candidate_k
-        )
-        web_results: list[WebResult] = []
-        if understood.needs_web or not candidates:
-            web_results = _web_search(understood, self.session)
-            candidates = _merge_web(candidates, web_results, final_k or settings.rag_candidate_k)
-        ranked, strategy = await rerank(understood, candidates, final_k or settings.rag_final_k, provider=rerank_provider)
-        final: list[Candidate] = []
-        for candidate, score, reason in ranked:
-            candidate.final_score = score
-            candidate.reasons.append(f"重排 {strategy}: {reason}")
-            final.append(candidate)
-        for i, candidate in enumerate(final, start=1):
-            candidate.rank = i
-            candidate.ref = f"c{i}"
-        return understood, final, strategy, web_results
+def _plan_for(session, space_id: int, question: str, components) -> QueryPlan:
+    domain = _domain_of(session, space_id)
+    lexicon = packs.lexicon_for(domain)
+    return understand(
+        session,
+        space_id,
+        question,
+        synonyms=lexicon.get("synonyms") or {},
+        llm=components.llm,
+    )
 
-    async def run(
-        self,
-        question: str,
-        space_id: int,
-        *,
-        history: list[dict[str, str]] | None = None,
-        final_k: int | None = None,
-        rerank_provider: str | None = None,
-        extra: str = "",
-    ) -> AsyncIterator[dict[str, Any]]:
-        started = time.perf_counter()
-        answer_id = uuid.uuid4().hex[:16]
-        try:
-            understood, candidates, strategy, web_results = await self.prepare(
-                question,
-                space_id,
-                history=history,
-                final_k=final_k,
-                rerank_provider=rerank_provider,
+
+def ask(
+    session,
+    space_id: int,
+    question: str,
+    *,
+    components=None,
+    top_k: int | None = None,
+) -> dict:
+    components = components or get_components()
+    started = time.perf_counter()
+
+    plan = _plan_for(session, space_id, question, components)
+    chunks = retrieve(session, space_id, plan, components=components, top_k=top_k or 8)
+    reranked = components.reranker.rerank(
+        plan.question,
+        [
+            RerankItem(
+                chunk_id=item.chunk_id,
+                text=item.text,
+                score=item.score,
+                meta={**item.signals, "authority": item.signals.get("authority", 3)},
             )
-        except Exception as exc:  # noqa: BLE001
-            yield {"type": "error", "stage": "prepare", "message": str(exc)[:400]}
-            return
+            for item in chunks
+        ],
+        top_k=top_k or 8,
+    )
+    by_id = {item.chunk_id: item for item in chunks}
+    ordered = []
+    for hit in reranked:
+        original = by_id.get(hit.chunk_id)
+        if original is not None:
+            original.score = hit.score
+            original.signals["reranked"] = True
+            original.signals["why"] = hit.meta.get("why", "")
+            ordered.append(original)
 
-        known_labels = [label for _id, label, _d in self.known_types(space_id)]
-        domain_label = lexicon_for(self.session, space_id)["label"]
-        yield {
-            "type": "stage",
-            "stage": "understood",
-            "answer_id": answer_id,
-            "understood": understood.to_dict(),
-        }
-        yield {
-            "type": "stage",
-            "stage": "retrieved",
-            "answer_id": answer_id,
-            "strategy": strategy,
-            "candidates": [c.as_dict() for c in candidates],
-            "web_results": [w.__dict__ for w in web_results],
-            "empty": not candidates,
-        }
+    domain_context = packs.prompt_context_for(_domain_of(session, space_id))
+    answer, tag_map = generate(components, plan, ordered, domain_context=domain_context)
+    answer = normalize_tags(answer)
+    citations = bind(answer, tag_map)
 
-        answer_parts: list[str] = []
-        citations: list[dict[str, Any]] = []
-        coverage: dict[str, Any] = {}
-        async for event in stream_answer(
-            understood,
-            candidates,
-            session=self.session,
-            known_types=known_labels,
-            extra=extra,
-            answer_id=answer_id,
-            domain_label=domain_label,
-        ):
-            if event["type"] == "context":
-                continue
-            if event["type"] == "token":
-                answer_parts.append(event["text"])
-            elif event["type"] == "citations":
-                citations = event["citations"]
-            elif event["type"] == "done":
-                coverage = event["coverage"]
-            yield event
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    trace = QueryTrace(
+        space_id=space_id,
+        question=question,
+        intent=plan.intent,
+        sub_questions=plan.sub_questions,
+        filters=plan.filters,
+        retrieved=[item.as_dict() for item in ordered],
+        answer=answer,
+        citations=[citation.as_dict() for citation in citations],
+        provider=getattr(components.llm, "name", "unknown"),
+        latency_ms=latency_ms,
+    )
+    session.add(trace)
+    session.commit()
 
-        self._persist(
-            answer_id=answer_id,
-            space_id=space_id,
-            question=question,
-            understood=understood,
-            candidates=candidates,
-            strategy=strategy,
-            answer="".join(answer_parts),
-            citations=citations,
-            coverage=coverage,
-            elapsed_ms=int((time.perf_counter() - started) * 1000),
-        )
-        # 流式响应期间事务保持打开会阻塞其它写入，落库后立即释放
-        self.session.commit()
-
-    def _persist(
-        self,
-        *,
-        answer_id: str,
-        space_id: int,
-        question: str,
-        understood: UnderstoodQuery,
-        candidates: list[Candidate],
-        strategy: str,
-        answer: str,
-        citations: list[dict],
-        coverage: dict,
-        elapsed_ms: int,
-    ) -> QueryTrace:
-        trace = QueryTrace(
-            answer_id=answer_id,
-            space_id=space_id,
-            question=question,
-            understood=understood.to_dict(),
-            retrieval=[c.as_dict() for c in candidates],
-            rerank=[
-                {"ref": c.ref, "chunk_id": c.chunk_id, "score": c.final_score, "strategy": strategy, "reasons": c.reasons}
-                for c in candidates
-            ],
-            answer=answer,
-            citations=citations,
-            coverage=float((coverage or {}).get("coverage", 0.0)),
-            elapsed_ms=elapsed_ms,
-        )
-        self.session.add(trace)
-        self.session.flush()
-        return trace
-
-    def recent_traces(self, space_id: int | None, limit: int = 20) -> list[QueryTrace]:
-        stmt = select(QueryTrace).order_by(QueryTrace.id.desc())
-        if space_id:
-            stmt = stmt.where(QueryTrace.space_id == space_id)
-        return list(self.session.scalars(stmt.limit(limit)).all())
+    return {
+        "trace_id": trace.id,
+        "question": question,
+        "answer": answer,
+        "citations": [citation.as_dict() for citation in citations],
+        "plan": plan.as_dict(),
+        "retrieved": [item.as_dict() for item in ordered],
+        "provider": getattr(components.llm, "name", "unknown"),
+        "latency_ms": latency_ms,
+    }
 
 
-def _web_search(understood: UnderstoodQuery, session: Session) -> list[WebResult]:
-    provider = registry.web_search()
-    if provider.name == "none":
-        understood.notes.append("网络搜索组件未启用，仅使用本地知识库")
-        return []
+def ask_stream(
+    space_id: int,
+    question: str,
+    *,
+    top_k: int | None = None,
+) -> Iterator[dict]:
+    """SSE 事件流：每个 dict 会被 api 层编码成一条 ``data:``。"""
+    components = get_components()
+    started = time.perf_counter()
     try:
-        results = provider.search(understood.rewritten or understood.original, top_k=4)
-    except Exception as exc:  # noqa: BLE001
-        understood.notes.append(f"网络搜索失败: {str(exc)[:120]}")
-        return []
-    understood.notes.append(f"联网补充 {len(results)} 条结果")
-    return results
+        with session_scope() as session:
+            plan = _plan_for(session, space_id, question, components)
+            chunks = retrieve(session, space_id, plan, components=components, top_k=top_k or 8)
+            domain_context = packs.prompt_context_for(_domain_of(session, space_id))
 
+        yield {"type": "plan", "data": plan.as_dict()}
+        yield {"type": "retrieval", "data": [item.as_dict() for item in chunks]}
 
-def _merge_web(candidates: list[Candidate], results: list[WebResult], limit: int) -> list[Candidate]:
-    if not results:
-        return candidates
-    extra: list[Candidate] = []
-    for i, result in enumerate(results):
-        text = f"{result.title}\n{result.snippet}"
-        if not text.strip():
-            continue
-        extra.append(
-            Candidate(
-                chunk_id=-(i + 1),
-                doc_id=0,
-                text=text,
-                locator=result.url,
-                meta={
-                    "doc_name": result.title or result.url,
-                    "doc_type": f"网络检索({result.source})",
-                    "authority": 0.35,
-                    "url": result.url,
-                },
-                fused_score=0.02 + 0.01 * (len(results) - i),
-                reasons=["联网补充来源"],
+        stream, tag_map = generate_stream(components, plan, chunks, domain_context=domain_context)
+        collected: list[str] = []
+        for piece in stream:
+            if not piece:
+                continue
+            collected.append(piece)
+            yield {"type": "token", "text": piece}
+
+        answer = normalize_tags("".join(collected))
+        citations = bind(answer, tag_map)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+
+        with session_scope() as session:
+            trace = QueryTrace(
+                space_id=space_id,
+                question=question,
+                intent=plan.intent,
+                sub_questions=plan.sub_questions,
+                filters=plan.filters,
+                retrieved=[item.as_dict() for item in chunks],
+                answer=answer,
+                citations=[citation.as_dict() for citation in citations],
+                provider=getattr(components.llm, "name", "unknown"),
+                latency_ms=latency_ms,
             )
-        )
-    return (candidates + extra)[: max(limit, len(candidates))]
+            session.add(trace)
+            session.flush()
+            trace_id = trace.id
+
+        yield {
+            "type": "citations",
+            "data": [citation.as_dict() for citation in citations],
+        }
+        yield {
+            "type": "done",
+            "data": {
+                "trace_id": trace_id,
+                "answer": answer,
+                "latency_ms": latency_ms,
+                "provider": getattr(components.llm, "name", "unknown"),
+                "uncited": [truncate(item.text, 60) for item in chunks[len(citations) :]],
+            },
+        }
+    except Exception as exc:  # noqa: BLE001 - 流式接口必须把错误变成事件
+        yield {"type": "error", "message": f"{type(exc).__name__}: {exc}"}

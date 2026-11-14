@@ -1,7 +1,14 @@
-"""领域包（Domain Pack）：把一个本体领域的词表、基线类型、关联与示例语料打包成一个可安装单元。
+"""领域包（Domain Pack）契约。
 
-平台不再把「金融」写死在代码里：金融只是内置的领域包之一，维修、人工智能、计算机网络
-同理。新增一个领域 = 在本目录放一个模块，声明一个 DomainPack，无需改动服务层与前端。
+一个领域包 = 一个 Python 模块，声明「这个领域里有什么」，不含任何逻辑分支。
+新增领域只需要：写一个 ``xxx.py`` 声明 ``PACK``，放进 ``server/data/samples/<key>/`` 语料，
+在 ``packs/__init__.py`` 的 ``PACKS`` 加一行。服务层、接口层、前端一行都不用改。
+
+为什么领域不能写死在代码里
+--------------------------
+写死的话，每加一个领域就要改「词表」「提示词」「前端下拉框」「导出模板」四处，
+改一处漏一处，最后变成 if/elif 大杂烩。这里把领域知识全部收敛成**数据**，
+代码只消费数据，所以「加领域」= 加数据。
 """
 
 from __future__ import annotations
@@ -10,132 +17,134 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# 关联局部名 → 关系类别：跨领域通用的骨架，领域包可用 link_categories 补充自己的局部名
-COMMON_LINK_CATEGORIES: dict[str, str] = {
-    "subClassOf": "taxonomy",
-    "partOf": "part_of",
-    "hasPart": "part_of",
-    "references": "reference",
-    "isDefinedBy": "regulatory",
-    "hasParticipant": "participant",
-    "triggers": "causal",
-    "derivedFrom": "derivation",
-    "associatedWith": "association",
-    "requires": "regulatory",
-    "constrains": "regulatory",
-    "evidences": "reference",
-    "records": "reference",
-}
+SAMPLES_ROOT = Path(__file__).resolve().parents[4] / "data" / "samples"
 
 
-@dataclass
+@dataclass(slots=True)
 class SampleDoc:
-    """随领域包发布的示例语料（位于 data/samples/<pack_key>/ 下）。"""
+    """随领域包发布的示例语料描述（文件在 ``data/samples/<pack>/<filename>``）。"""
 
     filename: str
-    doc_type: str = "参考资料"
+    title: str
+    doc_type: str = "制度"
     issuer: str = ""
     jurisdiction: str = ""
-    authority: float = 0.6
+    authority: int = 3
+    language: str = "zh"
+
+    def path(self, pack_key: str) -> Path:
+        return SAMPLES_ROOT / pack_key / self.filename
+
+    def exists(self, pack_key: str) -> bool:
+        return self.path(pack_key).is_file()
 
 
-@dataclass
+@dataclass(slots=True)
 class DomainPack:
+    # ---- 身份 ----
     key: str
     label: str
     summary: str
     space_name: str
     space_iri: str
     space_description: str
-    business_domains: list[str]
-    object_types: list[dict[str, Any]]
-    links: list[tuple[str, str, str, str]]
+
+    # ---- 受控词表 ----
+    business_domains: list[str] = field(default_factory=list)
+    kinds: tuple[str, ...] = ()
+    relation_categories: tuple[str, ...] = ()
+
+    # ---- 基线本体 ----
+    object_types: list[dict[str, Any]] = field(default_factory=list)
+    links: list[dict[str, Any]] = field(default_factory=list)
+
+    # ---- 示例语料 ----
     samples: list[SampleDoc] = field(default_factory=list)
-    # 词表扩展：在通用 OBJECT_KINDS / RELATION_CATEGORIES 之上叠加本领域常用维度
-    extra_kinds: dict[str, str] = field(default_factory=dict)
-    extra_relation_categories: dict[str, str] = field(default_factory=dict)
-    facets: dict[str, str] = field(default_factory=dict)
-    standards: list[str] = field(default_factory=list)
-    classification: dict[str, str] = field(default_factory=dict)
-    link_categories: dict[str, str] = field(default_factory=dict)
-    # 供离线术语抽取与 Mock 推理使用的领域线索
+
+    # ---- 离线抽取线索（无模型时决定「什么算术语」）----
     term_suffixes: tuple[str, ...] = ()
     clause_markers: tuple[str, ...] = ()
-    domain_cues: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    tag_cues: dict[str, str] = field(default_factory=dict)
+    domain_cues: tuple[str, ...] = ()
+    tag_cues: tuple[str, ...] = ()
     synonyms: dict[str, list[str]] = field(default_factory=dict)
-    # 问答页签的起手问题：跟着领域包走，切空间就不再是金融问题打头
+
+    # ---- 标准与分类（导出 SKOS / 报告用）----
+    standards: list[str] = field(default_factory=list)
+    classification: list[str] = field(default_factory=list)
+    facets: list[str] = field(default_factory=list)
+
+    # ---- 交互 ----
     sample_questions: list[str] = field(default_factory=list)
     agent_hint: str = ""
 
-    def category_of(self, local_name: str) -> str:
-        return self.link_categories.get(local_name) or COMMON_LINK_CATEGORIES.get(local_name, "association")
+    # ------------------------------------------------------------------ #
+    def type_labels(self) -> list[str]:
+        return [item["label"] for item in self.object_types if item.get("label")]
 
-    def sample_dir(self, server_root: Path) -> Path:
-        return server_root / "data" / "samples" / self.key
-
-    def guess_domain(self, text: str) -> str:
-        """按领域线索把一段文本归到某个业务子域，供离线抽取与提案兜底使用。"""
-        body = text or ""
-        for domain, cues in self.domain_cues.items():
-            if any(cue in body for cue in cues):
-                return domain
-        return "通用" if "通用" in self.business_domains else (self.business_domains[-1] if self.business_domains else "")
-
-    def guess_tags(self, text: str) -> list[str]:
-        tags = [tag for cue, tag in self.tag_cues.items() if cue in (text or "")]
-        return tags or ["候选"]
-
-    def prompt_context(self) -> str:
-        """注入 LLM 提示词的领域说明书：领域名 + 子域划分 + 建模侧重。
-
-        其中「子域线索」「标签线索」两行既提示真实模型，也被离线 Mock 解析，
-        使不带密钥时产出的 business_domain / tags 同样跟随当前领域。
-        """
-        parts = [f"当前本体领域：{self.label}（领域包 {self.key}）。"]
-        if self.agent_hint:
-            parts.append(self.agent_hint)
-        parts.append("business_domain 只能取以下之一：" + "、".join(self.business_domains) + "。")
-        if self.domain_cues:
-            parts.append(
-                "子域线索："
-                + "; ".join(f"{domain}={','.join(cues)}" for domain, cues in self.domain_cues.items())
-                + "。"
-            )
-        if self.tag_cues:
-            parts.append("标签线索：" + "; ".join(f"{cue}→{tag}" for cue, tag in self.tag_cues.items()) + "。")
-        if self.term_suffixes:
-            parts.append("术语后缀：" + "、".join(self.term_suffixes[:24]) + "。")
-        if self.synonyms:
-            parts.append(
-                "同义口径：" + "；".join(f"{term}≈{'、'.join(values)}" for term, values in list(self.synonyms.items())[:10]) + "。"
-            )
-        if self.standards:
-            parts.append("可引用的标准/规范：" + "、".join(self.standards[:6]) + "。")
-        if self.facets:
-            parts.append("建议补充的注解维度：" + "、".join(f"{k}（{v}）" for k, v in self.facets.items()) + "。")
-        return "\n".join(parts)
-
-    def as_descriptor(self) -> dict[str, Any]:
-        """不含类型明细的轻量描述，供前端目录展示。"""
+    def vocab(self) -> dict[str, Any]:
+        """给前端受控词表（下拉框/筛选器直接消费）。"""
         return {
-            "key": self.key,
+            "pack": self.key,
             "label": self.label,
-            "summary": self.summary,
-            "space_name": self.space_name,
             "business_domains": self.business_domains,
-            "kinds": {**self._base_kinds(), **self.extra_kinds},
-            "facets": self.facets,
+            "kinds": list(self.kinds or DEFAULT_KINDS),
+            "relation_categories": list(self.relation_categories or DEFAULT_RELATION_CATEGORIES),
             "standards": self.standards,
             "classification": self.classification,
+            "facets": self.facets,
             "type_count": len(self.object_types),
             "link_count": len(self.links),
-            "samples": [s.filename for s in self.samples],
-            "sample_questions": self.sample_questions,
-            "agent_hint": self.agent_hint,
         }
 
-    def _base_kinds(self) -> dict[str, str]:
-        from ..kinds import OBJECT_KINDS
+    def prompt_context(self) -> str:
+        """注入草案服务与 ReAct 系统提示的领域上下文。"""
+        lines = [
+            f"领域：{self.label}（{self.key}）",
+            f"业务子域：{'、'.join(self.business_domains) or '未限定'}",
+            f"术语后缀线索：{'、'.join(self.term_suffixes) or '无'}",
+            f"条款标记：{'、'.join(self.clause_markers) or '无'}",
+            f"领域线索词：{'、'.join(self.domain_cues) or '无'}",
+        ]
+        if self.standards:
+            lines.append(f"参考标准：{'、'.join(self.standards)}")
+        if self.agent_hint:
+            lines.append(f"推理提示：{self.agent_hint}")
+        return "\n".join(lines)
 
-        return dict(OBJECT_KINDS)
+    def sample_manifest(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "filename": doc.filename,
+                "title": doc.title,
+                "doc_type": doc.doc_type,
+                "authority": doc.authority,
+                "available": doc.exists(self.key),
+                "size": doc.path(self.key).stat().st_size if doc.exists(self.key) else 0,
+            }
+            for doc in self.samples
+        ]
+
+
+#: 全领域通用的对象类型种类（领域包可以追加，但不该收窄）
+DEFAULT_KINDS: tuple[str, ...] = (
+    "class",
+    "agreement",
+    "role",
+    "document",
+    "metric",
+    "event",
+    "organization",
+    "asset",
+    "process",
+)
+
+#: 全领域通用的关联语义
+DEFAULT_RELATION_CATEGORIES: tuple[str, ...] = (
+    "taxonomy",
+    "participant",
+    "reference",
+    "derivation",
+    "regulatory",
+    "part_of",
+    "causal",
+)

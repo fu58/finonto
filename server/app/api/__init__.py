@@ -1,1 +1,1 @@
-"""FinOnto api"""
+"""HTTP 接口层。"""

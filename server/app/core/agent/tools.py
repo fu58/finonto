@@ -1,707 +1,445 @@
-"""工具注册表：Agent 的可执行动作面。
+"""Agent 工具注册表。
 
-工具分四类风险：`read`（只读）、`write`（写提案，不直接改正式本体）、
-`exec`（沙箱执行）、`network`（出网）。所有写操作只产生 ChangeProposal，
-由人工确认后入库 —— 这是「引导 Agent」和「自动落库」之间的安全边界。
+设计约束
+--------
+1. **工具只返回结构化 observation**，不做副作用渲染；
+2. **写本体只能通过提案**：``propose_type`` 产出 ``ChangeProposal``，绝不直接写库；
+3. 每个工具声明风险等级 ``read / write / exec / network``，技能包按白名单授权；
+4. 参数用 JSON Schema 描述，前端与真实模型共用同一份签名（可直接转 function calling）。
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import Awaitable, Callable
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
 
-from ...models import AgentRun, Chunk, DocumentRecord, ObjectType, WikiPage
-from ...providers.base import ChatMessage
-from ...providers.registry import registry
-from ...providers.search.web import NoopWebSearch
-from ..ontology.owl import export_bundle, to_json_schema, to_skos, to_turtle
-from ..ontology.packs import lexicon_for
-from ..ontology.service import OntologyService
-from ..rag.generator import answer_once
+from ...models import Document, ObjectType
+from ..ontology import packs, service
+from ..rag.pipeline import ask
 from ..rag.query_understanding import understand
-from ..rag.retriever import Candidate, HybridRetriever
-from . import sandbox
-from .mcp_client import mcp_manager
-from .memory import MemoryService
-from .skills import get_skill
-
-Handler = Callable[["ToolContext", dict[str, Any]], Awaitable[dict[str, Any]]]
+from ..rag.retriever import retrieve
+from ..text import truncate
 
 
-@dataclass
+@dataclass(slots=True)
 class ToolContext:
-    session: Session
+    session: Any
     space_id: int
+    components: Any
     run_id: int | None = None
-    skill: str | None = None
-    candidates: list[Candidate] = field(default_factory=list)
-    evidence_by_chunk: dict[int, Candidate] = field(default_factory=dict)
-    scratchpad: list[dict[str, Any]] = field(default_factory=list)
 
-    def evidence_for(self, text: str, *, limit: int = 3) -> list[dict[str, Any]]:
-        """从最近检索到的片段中挑出能支撑该结论的证据。"""
-        from ..text import overlap
+    @property
+    def domain(self) -> str:
+        from ...models import OntologySpace
 
-        ranked = sorted(self.candidates, key=lambda c: -overlap(text, c.text))
-        out: list[dict[str, Any]] = []
-        for candidate in ranked[:limit]:
-            if overlap(text, candidate.text) < 0.08 and not candidate.reasons:
-                continue
-            out.append(
-                {
-                    "chunk_id": candidate.chunk_id,
-                    "doc_id": candidate.doc_id,
-                    "locator": candidate.locator,
-                    "quote": candidate.text[:240],
-                    "score": candidate.final_score or candidate.fused_score,
-                    "answer_id": f"run:{self.run_id}" if self.run_id else "",
-                }
-            )
-        return out
+        space = self.session.get(OntologySpace, self.space_id)
+        return space.domain if space else "general"
 
 
-@dataclass
-class ToolSpec:
+@dataclass(slots=True)
+class Tool:
     name: str
     description: str
-    parameters: dict[str, dict[str, Any]]
-    handler: Handler
-    category: str
+    parameters: dict[str, Any]
+    handler: Callable[..., dict]
+    category: str = "general"
     risk: str = "read"
 
-    def render(self) -> str:
-        params = ", ".join(
-            f"{key}({spec.get('type', 'string')}{'/必填' if spec.get('required') else ''})"
-            for key, spec in self.parameters.items()
-        )
-        return f"- {self.name}: {self.description} 参数: {params or '无'} [风险:{self.risk}]"
 
-    def schema(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "category": self.category,
-            "risk": self.risk,
-            "parameters": self.parameters,
-        }
-
-
+@dataclass(slots=True)
 class ToolRegistry:
-    def __init__(self) -> None:
-        self._tools: dict[str, ToolSpec] = {}
+    tools: dict[str, Tool] = field(default_factory=dict)
 
     def register(
         self,
         name: str,
         description: str,
-        parameters: dict[str, dict[str, Any]],
-        handler: Handler,
+        parameters: dict[str, Any],
+        handler: Callable[..., dict],
         *,
-        category: str,
+        category: str = "general",
         risk: str = "read",
     ) -> None:
-        self._tools[name] = ToolSpec(name, description, parameters, handler, category, risk)
+        self.tools[name] = Tool(
+            name=name,
+            description=description,
+            parameters=parameters,
+            handler=handler,
+            category=category,
+            risk=risk,
+        )
 
-    def tools(self, allowed: list[str] | None = None) -> list[ToolSpec]:
-        rows = list(self._tools.values())
-        if allowed:
-            expanded = set(allowed) | {name for name in self._tools if name.startswith("mcp.") and any(a.startswith("mcp.") for a in allowed)}
-            rows = [t for t in rows if t.name in expanded]
-        return rows
+    def get(self, name: str) -> Tool | None:
+        return self.tools.get(name)
 
-    def describe(self, allowed: list[str] | None = None) -> str:
-        return "\n".join(tool.render() for tool in self.tools(allowed))
+    def names(self) -> list[str]:
+        return sorted(self.tools)
 
-    def schemas(self, allowed: list[str] | None = None) -> list[dict[str, Any]]:
-        return [tool.schema() for tool in self.tools(allowed)]
+    def catalog(self, allowed: list[str] | None = None) -> list[dict[str, Any]]:
+        names = [n for n in self.names() if not allowed or n in allowed]
+        return [
+            {
+                "name": self.tools[n].name,
+                "description": self.tools[n].description,
+                "parameters": self.tools[n].parameters,
+                "category": self.tools[n].category,
+                "risk": self.tools[n].risk,
+            }
+            for n in names
+        ]
 
-    async def execute(self, ctx: ToolContext, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        tool = self._tools.get(name)
+    def invoke(self, name: str, context: ToolContext, arguments: dict | None = None) -> dict[str, Any]:
+        tool = self.get(name)
         if tool is None:
-            if name.startswith("mcp."):
-                return await _mcp_fallback(ctx, name, arguments)
-            return {"ok": False, "error": f"未知工具 {name}，请从可用工具列表中选择"}
-        skill = get_skill(ctx.skill)
-        if skill and tool.name not in skill.allowed_tools:
-            return {"ok": False, "error": f"技能 {skill.name} 不允许调用 {tool.name}"}
-        missing = [k for k, spec in tool.parameters.items() if spec.get("required") and not str(arguments.get(k, "")).strip()]
-        if missing:
-            return {"ok": False, "error": f"缺少必填参数: {', '.join(missing)}"}
+            return {"ok": False, "error": f"未知工具：{name}"}
+        started = time.perf_counter()
         try:
-            result = await tool.handler(ctx, arguments)
-        except Exception as exc:  # noqa: BLE001  工具异常要变成 observation 而非中断整轮推理
-            return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:400]}"}
+            result = tool.handler(context, **(arguments or {}))
+            if not isinstance(result, dict):
+                result = {"result": result}
+            result.setdefault("ok", True)
+        except Exception as exc:  # noqa: BLE001 - 工具异常必须变成 observation
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        result["elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+        result["tool"] = name
         return result
 
-    def has(self, name: str) -> bool:
-        return name in self._tools
+
+R = ToolRegistry()
 
 
-registry_tools = ToolRegistry()
-P = {"required": True}
-
-
-def _param(**kwargs: Any) -> dict[str, Any]:
-    base = {"type": "string", "required": False, "description": ""}
-    base.update(kwargs)
-    return base
-
-
-# ---------------------------------------------------------------- 检索类工具
-async def _rag_search(ctx: ToolContext, args: dict) -> dict:
-    query = args["query"]
-    top_k = int(args.get("top_k") or 6)
-    lexicon = lexicon_for(ctx.session, ctx.space_id)
-    understood = understand(
-        query,
-        known_types=[(t.id, t.label, t.definition or "") for t in ctx.session.scalars(select(ObjectType).where(ObjectType.space_id == ctx.space_id))],
-        synonyms=lexicon["synonyms"],
-        extra_suffixes=lexicon["term_suffixes"],
-    )
-    candidates = HybridRetriever(ctx.session).search(understood, ctx.space_id, final_k=top_k)
-    ctx.candidates = candidates
-    ctx.evidence_by_chunk = {c.chunk_id: c for c in candidates}
+# --------------------------------------------------------------------------- #
+# 读类工具
+# --------------------------------------------------------------------------- #
+def _rag_search(ctx: ToolContext, query: str = "", top_k: int = 5) -> dict:
+    if not query:
+        return {"ok": False, "error": "query 不能为空"}
+    result = ask(ctx.session, ctx.space_id, query, components=ctx.components, top_k=int(top_k))
     return {
         "ok": True,
-        "summary": f"检索到 {len(candidates)} 条片段",
-        "intent": understood.intent,
-        "expansions": understood.expansions[:6],
-        "results": [
+        "answer": truncate(result["answer"], 400),
+        "citations": result["citations"][:5],
+        "retrieved": [
             {
-                "ref": c.ref,
-                "chunk_id": c.chunk_id,
-                "doc": c.meta.get("doc_name", ""),
-                "locator": c.locator,
-                "score": round(c.final_score or c.fused_score, 3),
-                "text": c.text[:280],
+                "chunk_id": item["chunk_id"],
+                "document_id": item["document_id"],
+                "doc_title": item["doc_title"],
+                "locator": item["locator"],
+                "text": truncate(item["text"], 220),
             }
-            for c in candidates
+            for item in result["retrieved"][:5]
         ],
-        "empty": not candidates,
-        "reasoning_hint": (
-            "无结果：本地知识库缺少相关材料，可调用 search.web 或先上传文档"
-            if not candidates
-            else "可基于以上片段调用 ontology.propose_type 生成候选对象类型"
-        ),
     }
 
 
-async def _rag_read_chunk(ctx: ToolContext, args: dict) -> dict:
-    chunk = ctx.session.get(Chunk, int(args["chunk_id"]))
-    if chunk is None:
-        return {"ok": False, "error": "片段不存在"}
-    doc = ctx.session.get(DocumentRecord, chunk.doc_id)
+def _doc_list(ctx: ToolContext, limit: int = 20) -> dict:
+    rows = ctx.session.execute(
+        select(Document).where(Document.space_id == ctx.space_id).order_by(Document.id.desc()).limit(int(limit))
+    ).scalars().all()
     return {
         "ok": True,
-        "chunk_id": chunk.id,
-        "doc_id": chunk.doc_id,
-        "doc_name": doc.name if doc else "",
-        "locator": chunk.locator,
-        "ordinal": chunk.ordinal,
-        "text": chunk.text,
-    }
-
-
-async def _rag_ask(ctx: ToolContext, args: dict) -> dict:
-    from ..rag.pipeline import RagPipeline
-
-    pipeline = RagPipeline(ctx.session)
-    understood, candidates, _strategy, _web = await pipeline.prepare(args["question"], ctx.space_id, final_k=int(args.get("top_k") or 6))
-    payload = await answer_once(
-        understood,
-        candidates,
-        session=ctx.session,
-        answer_id=f"tool-{ctx.run_id}",
-        domain_label=lexicon_for(ctx.session, ctx.space_id)["label"],
-    )
-    ctx.candidates = candidates
-    ctx.evidence_by_chunk = {c.chunk_id: c for c in candidates}
-    return {"ok": True, "answer": payload["answer"][:3000], "citations": payload["citations"][:10], "coverage": payload["coverage"]}
-
-
-# ---------------------------------------------------------------- 文档类工具
-async def _doc_list(ctx: ToolContext, args: dict) -> dict:
-    rows = ctx.session.scalars(select(DocumentRecord).order_by(DocumentRecord.id.desc()).limit(int(args.get("limit") or 30))).all()
-    out = []
-    for doc in rows:
-        chunk_count = ctx.session.scalar(select(func.count()).select_from(Chunk).where(Chunk.doc_id == doc.id)) or 0
-        out.append(
+        "count": len(rows),
+        "documents": [
             {
-                "doc_id": doc.id,
-                "name": doc.name,
-                "format": doc.doc_format,
-                "doc_type": doc.doc_type,
-                "chunks": chunk_count,
-                "status": doc.status,
-                "authority": doc.authority,
-                "space_id": doc.space_id,
+                "id": row.id,
+                "title": row.title,
+                "doc_type": row.doc_type,
+                "authority": row.authority,
+                "jurisdiction": row.jurisdiction,
+                "page_count": row.page_count,
             }
-        )
-    return {"ok": True, "summary": f"共 {len(out)} 份文档", "documents": out}
+            for row in rows
+        ],
+    }
 
 
-async def _doc_read(ctx: ToolContext, args: dict) -> dict:
-    doc_id = int(args["doc_id"])
-    limit = int(args.get("max_chars") or 4000)
-    chunks = ctx.session.scalars(select(Chunk).where(Chunk.doc_id == doc_id).order_by(Chunk.ordinal)).all()
-    if not chunks:
-        return {"ok": False, "error": "该文档没有已索引片段"}
-    body: list[str] = []
-    used = 0
-    picked: list[Candidate] = []
-    for chunk in chunks:
-        piece = f"[{chunk.locator}] {chunk.text}"
-        if used + len(piece) > limit:
-            break
-        body.append(piece)
-        used += len(piece)
-        candidate = Candidate(chunk_id=chunk.id, doc_id=doc_id, text=chunk.text, locator=chunk.locator, meta=chunk.meta or {}, reasons=["文档直读"])
-        picked.append(candidate)
-    ctx.candidates = picked
-    ctx.evidence_by_chunk = {c.chunk_id: c for c in picked}
-    doc = ctx.session.get(DocumentRecord, doc_id)
-    return {"ok": True, "doc_id": doc_id, "doc_name": doc.name if doc else "", "chars": used, "text": "\n".join(body), "chunk_count": len(chunks)}
+def _doc_chunks(ctx: ToolContext, document_id: int = 0, limit: int = 8) -> dict:
+    from ...models import DocumentChunk
 
-
-# ---------------------------------------------------------------- 本体类工具
-async def _onto_list(ctx: ToolContext, args: dict) -> dict:
-    service = OntologyService(ctx.session)
-    rows = service.list_types(
-        ctx.space_id,
-        q=args.get("q") or None,
-        status=args.get("status") or None,
-        domain=args.get("domain") or None,
-        limit=int(args.get("limit") or 60),
-    )
+    query = select(DocumentChunk)
+    if document_id:
+        query = query.where(DocumentChunk.document_id == int(document_id))
+    rows = ctx.session.execute(
+        query.order_by(DocumentChunk.ordinal).limit(int(limit))
+    ).scalars().all()
     return {
         "ok": True,
-        "summary": f"当前空间有 {len(rows)} 个对象类型",
-        "stats": service.space_stats(ctx.space_id),
+        "chunks": [
+            {"chunk_id": row.id, "document_id": row.document_id, "locator": row.locator,
+             "text": truncate(row.text, 200)}
+            for row in rows
+        ],
+    }
+
+
+def _ontology_list_types(ctx: ToolContext, keyword: str = "", limit: int = 30) -> dict:
+    types = service.list_types(ctx.session, ctx.space_id, keyword=keyword)
+    return {
+        "ok": True,
+        "count": len(types),
         "types": [
-            {"id": t.id, "label": t.label, "label_en": t.label_en, "kind": t.kind, "status": t.status, "domain": t.business_domain, "definition": (t.definition or "")[:120]}
-            for t in rows
+            {"id": item["id"], "label": item["label"], "kind": item["kind_label"],
+             "business_domain": item["business_domain"], "properties": item["property_count"]}
+            for item in types[: int(limit)]
         ],
     }
 
 
-async def _onto_get(ctx: ToolContext, args: dict) -> dict:
-    service = OntologyService(ctx.session)
-    type_id = int(args["type_id"])
-    if not service.get_type(type_id):
-        return {"ok": False, "error": f"对象类型 {type_id} 不存在"}
-    return {"ok": True, "detail": service.detail(type_id)}
+def _ontology_type_detail(ctx: ToolContext, type_id: int = 0) -> dict:
+    detail = service.type_detail(ctx.session, int(type_id))
+    if detail is None:
+        return {"ok": False, "error": f"类型不存在：{type_id}"}
+    return {"ok": True, "type": {
+        "id": detail["id"], "label": detail["label"], "kind": detail["kind_label"],
+        "definition": truncate(detail["definition"], 300),
+        "properties": [p["label"] for p in detail["properties"]],
+        "links": [f"{l['relation']}→{l['target_label']}" for l in detail["links"]],
+        "constraints": [c["message"] for c in detail["constraints"]],
+        "evidence": detail["evidence"][:3],
+    }}
 
 
-async def _onto_find_similar(ctx: ToolContext, args: dict) -> dict:
-    service = OntologyService(ctx.session)
-    duplicates = service.similar_types(ctx.space_id, args["label"])
+def _find_similar(ctx: ToolContext, label: str = "", aliases: list[str] | None = None) -> dict:
+    if not label:
+        return {"ok": False, "error": "label 必填"}
+    similar = service.find_similar(ctx.session, ctx.space_id, label, aliases or [])
     return {
         "ok": True,
-        "label": args["label"],
-        "duplicates": duplicates,
-        "recommendation": "复用已有类型（调用 ontology.propose_update）" if any(d["reason"] == "同名" for d in duplicates) else ("确认区分度后可新增" if duplicates else "可以新增"),
+        "label": label,
+        "similar": similar,
+        "verdict": "疑似重复，建议改造成修改提案" if similar and similar[0]["score"] >= 0.8 else "可新建",
     }
 
 
-async def _onto_propose_type(ctx: ToolContext, args: dict) -> dict:
-    service = OntologyService(ctx.session)
-    payload: dict[str, Any] = {
-        "label": args["label"].strip(),
-        "label_en": args.get("label_en", ""),
-        "definition": args.get("definition", ""),
-        "kind": args.get("kind", "class"),
-        "business_domain": args.get("business_domain", "通用"),
-        "parent_label": args.get("parent_label", ""),
-        "aliases": _as_list(args.get("aliases")),
-        "tags": _as_list(args.get("tags")),
-        "annotations": args.get("annotations") or {},
-        "properties": args.get("properties") or [],
-        "relations": args.get("relations") or [],
-        "constraints": args.get("constraints") or [],
+def _graph_subgraph(ctx: ToolContext, node_id: str = "", depth: int = 1) -> dict:
+    from ..wiki import graph as wiki_graph
+
+    graph = wiki_graph.build_graph(ctx.session, ctx.space_id)
+    if not node_id:
+        return {"ok": True, "insights": wiki_graph.insights(ctx.session, ctx.space_id, graph)}
+    sub = wiki_graph.subgraph(graph, node_id, int(depth))
+    return {
+        "ok": True,
+        "focus": node_id,
+        "nodes": [{"id": n["id"], "label": n["label"], "kind": n["kind"]} for n in sub["nodes"]],
+        "edges": [{"source": e["source"], "target": e["target"], "kind": e["kind"], "label": e["label"]}
+                  for e in sub["edges"]],
     }
-    issues = service.validate_type_payload(payload, ctx.space_id)
-    blocking = [i for i in issues if i.level == "violation"]
-    if any(i.code == "duplicate_label" for i in blocking):
+
+
+def _wiki_list_pages(ctx: ToolContext, page_type: str = "", limit: int = 20) -> dict:
+    from ...models import WikiPage
+
+    query = select(WikiPage).where(WikiPage.space_id == ctx.space_id)
+    if page_type:
+        query = query.where(WikiPage.page_type == page_type)
+    rows = ctx.session.execute(query.limit(int(limit))).scalars().all()
+    return {
+        "ok": True,
+        "pages": [
+            {"slug": row.slug, "title": row.title, "version": row.version,
+             "dirty": row.is_dirty, "locked": row.is_locked}
+            for row in rows
+        ],
+    }
+
+
+def _wiki_read_page(ctx: ToolContext, slug: str = "") -> dict:
+    from ...models import WikiPage
+
+    page = ctx.session.execute(
+        select(WikiPage).where(WikiPage.space_id == ctx.space_id, WikiPage.slug == slug)
+    ).scalars().first()
+    if page is None:
+        return {"ok": False, "error": f"页面不存在：{slug}"}
+    return {"ok": True, "slug": page.slug, "title": page.title, "version": page.version,
+            "body": truncate(page.body, 800)}
+
+
+def _memory_search(ctx: ToolContext, query: str = "", limit: int = 5) -> dict:
+    from ..agent import memory as memory_service
+
+    items = memory_service.search(ctx.session, ctx.space_id, query, limit=int(limit))
+    return {"ok": True, "memories": items}
+
+
+# --------------------------------------------------------------------------- #
+# 写类工具（产出提案，不直接改本体）
+# --------------------------------------------------------------------------- #
+def _propose_type(ctx: ToolContext, draft: dict | None = None, rationale: str = "") -> dict:
+    if not isinstance(draft, dict) or not (draft.get("label") or "").strip():
+        return {"ok": False, "error": "draft.label 必填"}
+    label = draft["label"].strip()
+    similar = service.find_similar(ctx.session, ctx.space_id, label, draft.get("aliases") or [])
+    existing = ctx.session.execute(
+        select(ObjectType).where(ObjectType.space_id == ctx.space_id, ObjectType.label == label)
+    ).scalars().first()
+    if existing is not None:
         return {
             "ok": False,
-            "error": f"「{payload['label']}」已存在同名对象类型，请改用 ontology.propose_update 或换一个标签",
-            "duplicates": service.similar_types(ctx.space_id, payload["label"]),
+            "error": f"类型「{label}」已存在（#{existing.id}），请改用 update_type 提案",
+            "existing_type_id": existing.id,
         }
-    confidence = float(args.get("confidence") or 0.5)
+    evidence = []
+    for item in draft.get("evidence") or []:
+        if isinstance(item, dict):
+            evidence.append(
+                {
+                    "quote": item.get("quote", ""),
+                    "locator": item.get("locator", ""),
+                    "note": label,
+                }
+            )
     proposal = service.create_proposal(
+        ctx.session,
         ctx.space_id,
-        kind="object_type",
-        payload=payload,
-        rationale=args.get("rationale", "") or "由 Agent 依据检索到的资料生成",
-        confidence=confidence,
-        evidences=ctx.evidence_for(payload["label"] + " " + payload["definition"]),
-        run_id=ctx.run_id,
-        title=f"新增对象类型「{payload['label']}」",
+        "create_type",
+        draft,
+        rationale=rationale or f"Agent 提议新建类型「{label}」",
+        author="agent",
+        evidence=evidence,
+        agent_run_id=ctx.run_id,
     )
+    ctx.session.commit()
     return {
         "ok": True,
         "proposal_id": proposal.id,
-        "label": payload["label"],
-        "status": proposal.status,
-        "issues": [{"code": i.code, "level": i.level, "message": i.message} for i in issues],
-        "summary": f"提案 #{proposal.id}「{payload['label']}」已生成，等待人工确认（置信度 {confidence}）",
+        "label": label,
+        "similar": similar,
+        "requires_human_confirm": True,
+        "note": "提案已创建，需在「提案审核」页签人工确认后才会写入本体",
     }
 
 
-async def _onto_propose_link(ctx: ToolContext, args: dict) -> dict:
-    service = OntologyService(ctx.session)
-    source = service.find_type_by_label(ctx.space_id, args["source"])
-    target = service.find_type_by_label(ctx.space_id, args["target"])
-    if not source or not target:
-        return {"ok": False, "error": "源或目标对象类型必须已存在于本体中，请先为缺失概念生成提案"}
-    payload = {
-        "source": source.label,
-        "target": target.label,
-        "relation": args.get("relation", "关联"),
-        "cardinality": args.get("cardinality", "n:m"),
-        "description": args.get("description", ""),
-        "category": args.get("category", "association"),
-    }
-    proposal = service.create_proposal(
-        ctx.space_id,
-        kind="link",
-        payload=payload,
-        rationale=args.get("rationale", "由 Agent 依据共现证据生成关联"),
-        confidence=float(args.get("confidence") or 0.55),
-        evidences=ctx.evidence_for(f"{source.label} {target.label}"),
-        run_id=ctx.run_id,
-        title=f"新增关联 {source.label} —{payload['relation']}→ {target.label}",
-    )
-    return {"ok": True, "proposal_id": proposal.id, "summary": f"关联提案 #{proposal.id} 已生成"}
+def _memory_save(ctx: ToolContext, content: str = "", kind: str = "fact", keywords: str = "") -> dict:
+    from ..agent import memory as memory_service
+
+    if not content.strip():
+        return {"ok": False, "error": "content 不能为空"}
+    item = memory_service.save(ctx.session, ctx.space_id, content, kind=kind, keywords=keywords)
+    ctx.session.commit()
+    return {"ok": True, "memory_id": item.id, "kind": item.kind}
 
 
-async def _onto_propose_constraint(ctx: ToolContext, args: dict) -> dict:
-    service = OntologyService(ctx.session)
-    payload = {
-        "subject": args["subject"],
-        "name": args.get("name") or f"{args['subject']} 约束",
-        "kind": args.get("kind", "regulatory"),
-        "expression": args["expression"],
-        "severity": args.get("severity", "warning"),
-        "reg_ref": args.get("reg_ref", ""),
-        "property": args.get("property", ""),
-        "description": args.get("description", ""),
-    }
-    proposal = service.create_proposal(
-        ctx.space_id,
-        kind="constraint",
-        payload=payload,
-        rationale=args.get("rationale", "监管条款映射"),
-        confidence=float(args.get("confidence") or 0.7),
-        evidences=ctx.evidence_for(payload["expression"]),
-        run_id=ctx.run_id,
-        title=f"新增约束「{payload['name']}」",
-    )
-    return {"ok": True, "proposal_id": proposal.id}
+# --------------------------------------------------------------------------- #
+# 执行 / 网络类工具
+# --------------------------------------------------------------------------- #
+def _sandbox_run(ctx: ToolContext, code: str = "") -> dict:
+    from ..agent import sandbox as sandbox_service
+
+    result = sandbox_service.run(code)
+    return result
 
 
-async def _onto_propose_update(ctx: ToolContext, args: dict) -> dict:
-    service = OntologyService(ctx.session)
-    label = args.get("label") or ""
-    target = service.find_type_by_label(ctx.space_id, label)
-    if not target:
-        return {"ok": False, "error": f"对象类型「{label}」不存在，无法生成更新提案"}
-    patch = args.get("patch") or {}
-    if isinstance(patch, str):
-        try:
-            patch = json.loads(patch)
-        except json.JSONDecodeError:
-            return {"ok": False, "error": "patch 需为 JSON 对象"}
-    payload = {"label": target.label, "type_id": target.id, **patch}
-    proposal = service.create_proposal(
-        ctx.space_id,
-        kind="property" if set(patch) == {"properties"} else "object_type",
-        payload=payload,
-        rationale=args.get("rationale", "定义精化"),
-        confidence=float(args.get("confidence") or 0.75),
-        evidences=ctx.evidence_for(str(patch)[:400]),
-        run_id=ctx.run_id,
-        title=f"更新对象类型「{target.label}」",
-    )
-    return {"ok": True, "proposal_id": proposal.id, "kind": proposal.kind}
-
-
-async def _onto_validate(ctx: ToolContext, args: dict) -> dict:
-    service = OntologyService(ctx.session)
-    issues = service.validate_space(ctx.space_id)
-    grouped: dict[str, list[str]] = {}
-    for issue in issues:
-        grouped.setdefault(issue.code, []).append(issue.message)
+def _search_web(ctx: ToolContext, query: str = "", top_k: int = 5) -> dict:
+    searcher = ctx.components.web_search
+    if getattr(searcher, "name", "none") == "none":
+        return {"ok": False, "error": "网络搜索已关闭（组件中心可切换为 duckduckgo 或配置密钥）"}
+    results = searcher.search(query, top_k=int(top_k))
     return {
         "ok": True,
-        "summary": f"发现 {len(issues)} 个问题",
-        "counts": {level: sum(1 for i in issues if i.level == level) for level in ("violation", "warning", "info")},
-        "grouped": {k: v[:8] for k, v in grouped.items()},
-        "stats": service.space_stats(ctx.space_id),
+        "count": len(results),
+        "results": [{"title": r.title, "url": r.url, "snippet": truncate(r.snippet, 160)} for r in results],
     }
 
 
-async def _onto_export(ctx: ToolContext, args: dict) -> dict:
-    fmt = (args.get("format") or "turtle").lower()
-    if fmt == "turtle":
-        return {"ok": True, "format": fmt, "chars": 0, "content": to_turtle(ctx.session, ctx.space_id)[:6000]}
-    if fmt == "skos":
-        return {"ok": True, "format": fmt, "content": to_skos(ctx.session, ctx.space_id)[:6000]}
-    if fmt == "jsonschema":
-        if not args.get("type_id"):
-            return {"ok": False, "error": "jsonschema 导出需要 type_id"}
-        return {"ok": True, "format": fmt, "content": json.dumps(to_json_schema(ctx.session, ctx.space_id, int(args["type_id"])), ensure_ascii=False, indent=2)[:6000]}
-    return {"ok": False, "error": f"不支持的导出格式 {fmt}"}
+def _datasource_probe(ctx: ToolContext, uri: str = "") -> dict:
+    from ...providers.datasource import route
+
+    if not uri:
+        return {"ok": False, "error": "uri 必填"}
+    source = route(uri)
+    return {"ok": True, "probe": source.probe(uri)}
 
 
-# ---------------------------------------------------------------- 图谱 / Wiki
-async def _graph_subgraph(ctx: ToolContext, args: dict) -> dict:
-    from ..wiki.graph import GraphService
-
-    service = GraphService(ctx.session)
-    label = args.get("label") or ""
-    type_id = int(args["type_id"]) if args.get("type_id") else None
-    if not type_id:
-        row = OntologyService(ctx.session).find_type_by_label(ctx.space_id, label)
-        if not row:
-            return {"ok": False, "error": f"对象类型「{label}」不存在"}
-        type_id = row.id
-    graph = service.subgraph(ctx.space_id, type_id, depth=int(args.get("depth") or 2))
-    return {
-        "ok": True,
-        "center": label or str(type_id),
-        "nodes": [{"label": n["label"], "type": n["type"], "degree": n.get("degree", 0)} for n in graph["nodes"]][:60],
-        "edges": [{"source": e["source"], "relation": e.get("relation", ""), "target": e["target"]} for e in graph["edges"]][:80],
-        "stats": graph["stats"],
-    }
-
-
-async def _graph_stats(ctx: ToolContext, args: dict) -> dict:
-    from ..wiki.graph import GraphService
-
-    return {"ok": True, **GraphService(ctx.session).insights(ctx.space_id)}
-
-
-async def _wiki_draft_page(ctx: ToolContext, args: dict) -> dict:
-    service = OntologyService(ctx.session)
-    label = args["topic"]
-    row = service.find_type_by_label(ctx.space_id, label)
-    detail = service.detail(row.id) if row else {"label": label, "definition": args.get("definition", ""), "properties": [], "links": [], "annotations": {}}
-    payload = {
-        "label": detail["label"],
-        "definition": detail.get("definition", ""),
-        "properties": detail.get("properties", []),
-        "links": detail.get("links", []),
-        "annotations": detail.get("annotations", {}),
-    }
-    prompt = (
-        "[[TASK:wiki_page]]\n请为下面的对象类型生成结构化 Wiki 页面（Markdown），只输出 Markdown。\n\n"
-        f"## 页面数据\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```\n"
-    )
-    raw, _usage = await registry.llm().complete([ChatMessage(role="user", content=prompt)], task="wiki_page")
-    proposal = service.create_proposal(
-        ctx.space_id,
-        kind="wiki_page",
-        payload={"topic": label, "body_md": raw, "type_id": row.id if row else None},
-        rationale="Agent 生成的页面草稿，需人工确认后再落为版本",
-        confidence=0.6,
-        run_id=ctx.run_id,
-        title=f"Wiki 页面草稿「{label}」",
-    )
-    return {"ok": True, "proposal_id": proposal.id, "preview": raw[:1500], "chars": len(raw)}
-
-
-async def _wiki_read_page(ctx: ToolContext, args: dict) -> dict:
-    page = ctx.session.scalar(select(WikiPage).where(WikiPage.space_id == ctx.space_id, WikiPage.slug == args["slug"]))
-    if page is None:
-        pages = ctx.session.scalars(select(WikiPage).where(WikiPage.space_id == ctx.space_id).limit(40)).all()
-        return {"ok": False, "error": f"页面 {args['slug']} 不存在", "available": [p.slug for p in pages]}
-    from ..wiki.compiler import WikiCompiler
-
-    return {"ok": True, "slug": page.slug, "title": page.title, "body": WikiCompiler(ctx.session).current_body(page)[:6000]}
-
-
-# ---------------------------------------------------------------- 记忆 / 沙箱 / 搜索 / 数据源
-async def _memory_remember(ctx: ToolContext, args: dict) -> dict:
-    item = MemoryService(ctx.session).remember(
-        args["content"],
-        scope=f"space:{ctx.space_id}",
-        kind=args.get("kind", "fact"),
-        source_run_id=ctx.run_id,
-    )
-    return {"ok": bool(item), "memory_id": item.id if item else None, "summary": "已写入长期记忆" if item else "内容过短，未写入"}
-
-
-async def _memory_recall(ctx: ToolContext, args: dict) -> dict:
-    hits = MemoryService(ctx.session).recall(args["query"], scope=f"space:{ctx.space_id}", top_k=int(args.get("top_k") or 5))
-    return {"ok": True, "count": len(hits), "memories": [h.as_dict() for h in hits]}
-
-
-async def _sandbox_run(ctx: ToolContext, args: dict) -> dict:
-    result = await asyncio.to_thread(sandbox.run_python, args["code"], float(args.get("timeout") or 8.0))
-    return {
-        "ok": result.ok,
-        "stdout": result.stdout,
-        "stderr": result.stderr[:1500],
-        "exit_code": result.exit_code,
-        "elapsed_ms": result.elapsed_ms,
-        "violations": result.violations,
-    }
-
-
-async def _search_web(ctx: ToolContext, args: dict) -> dict:
-    provider = registry.web_search()
-    if isinstance(provider, NoopWebSearch):
-        return {"ok": False, "error": "网络搜索组件未启用（设置 FINONTO_WEB_SEARCH_PROVIDER=duckduckgo 或配置 API Key）"}
-    results = await asyncio.to_thread(provider.search, args["query"], int(args.get("top_k") or 5))
-    return {"ok": True, "count": len(results), "results": [r.__dict__ for r in results]}
-
-
-async def _search_fetch(ctx: ToolContext, args: dict) -> dict:
-    provider = registry.web_search()
-    if isinstance(provider, NoopWebSearch):
-        return {"ok": False, "error": "网络搜索组件未启用，无法抓取网页"}
-    text = await asyncio.to_thread(provider.fetch, args["url"], int(args.get("max_chars") or 6000))
-    return {"ok": True, "url": args["url"], "chars": len(text), "text": text}
-
-
-async def _datasource_describe(ctx: ToolContext, args: dict) -> dict:
-    source = registry.data_source(args["uri"])
-    tables = await asyncio.to_thread(source.describe, args["uri"])
-    return {
-        "ok": True,
-        "provider": source.name,
-        "tables": [{"name": t.name, "columns": t.columns, "rows": len(t.rows)} for t in tables],
-        "hint": "可用 ontology.propose_type 把表映射为对象类型，外键映射为关联",
-    }
-
-
-async def _datasource_profile(ctx: ToolContext, args: dict) -> dict:
-    from ...providers.datasource.connectors import profile_source
-
-    source = registry.data_source(args["uri"])
-    tables = await asyncio.to_thread(profile_source, source, args["uri"])
-    return {"ok": True, "profile": tables}
-
-
-async def _mcp_fallback(ctx: ToolContext, name: str, args: dict) -> dict:
-    parts = name.split(".", 2)
-    if len(parts) != 3:
-        return {"ok": False, "error": f"MCP 工具名格式应为 mcp.<server>.<tool>，收到 {name}"}
-    result = await asyncio.to_thread(mcp_manager.call, parts[1], parts[2], args)
-    return result if isinstance(result, dict) else {"ok": True, "result": result}
-
-
-# ---------------------------------------------------------------- 注册
+# --------------------------------------------------------------------------- #
+# 注册
+# --------------------------------------------------------------------------- #
 def _register_builtin() -> None:
-    R = registry_tools
-    R.register("rag.search", "在本地知识库做混合检索（BM25+向量+重排序），返回带定位的片段", {"query": _param(**P), "top_k": _param(type="integer")}, _rag_search, category="rag")
-    R.register("rag.read_chunk", "按 chunk_id 读取原文片段全文", {"chunk_id": _param(type="integer", **P)}, _rag_read_chunk, category="rag")
-    R.register("rag.ask", "对知识库提一个需要引用的问题，返回带引用的回答", {"question": _param(**P), "top_k": _param(type="integer")}, _rag_ask, category="rag")
-    R.register("doc.list", "列出知识库中的文档", {"limit": _param(type="integer")}, _doc_list, category="document")
-    R.register("doc.read", "读取指定文档的正文片段（作为证据来源）", {"doc_id": _param(type="integer", **P), "max_chars": _param(type="integer")}, _doc_read, category="document")
-
-    R.register("ontology.list_types", "列出本体空间中的对象类型与统计", {"q": _param(), "status": _param(), "domain": _param(), "limit": _param(type="integer")}, _onto_list, category="ontology")
-    R.register("ontology.get_type", "读取对象类型完整详情", {"type_id": _param(type="integer", **P)}, _onto_get, category="ontology")
-    R.register("ontology.find_similar", "查找与给定标签重复或相近的已有对象类型", {"label": _param(**P)}, _onto_find_similar, category="ontology")
     R.register(
-        "ontology.propose_type",
-        "提交新增对象类型提案（不直接写入本体，等待人工确认）",
-        {
-            "label": _param(**P),
-            "definition": _param(**P),
-            "label_en": _param(),
-            "kind": _param(enum=["class", "entity", "event", "product", "party", "agreement", "document", "metric", "process", "regulation", "attribute_domain"]),
-            "business_domain": _param(),
-            "parent_label": _param(),
-            "aliases": _param(type="array"),
-            "tags": _param(type="array"),
-            "properties": _param(type="array", description="[{label,datatype,required,unit,description}]"),
-            "relations": _param(type="array", description="[{target,relation,description,cardinality}]"),
-            "constraints": _param(type="array", description="[{name,kind,expression,severity,reg_ref}]"),
-            "annotations": _param(type="object", description="领域扩展注解，键随领域包，如 data_classification/reg_refs/risk_dimension/lifecycle"),
-            "confidence": _param(type="number"),
-            "rationale": _param(),
-        },
-        _onto_propose_type,
-        category="ontology",
-        risk="write",
+        "rag.search",
+        "在知识库中检索并回答问题，返回答案、引用与命中片段",
+        {"type": "object", "properties": {"query": {"type": "string"}, "top_k": {"type": "integer", "default": 5}},
+         "required": ["query"]},
+        _rag_search,
+        category="rag",
+        risk="read",
     )
-    R.register(
-        "ontology.propose_link",
-        "提交两个已有对象类型之间的关联提案",
-        {"source": _param(**P), "target": _param(**P), "relation": _param(**P), "description": _param(), "cardinality": _param(), "category": _param(), "confidence": _param(type="number"), "rationale": _param()},
-        _onto_propose_link,
-        category="ontology",
-        risk="write",
-    )
-    R.register(
-        "ontology.propose_constraint",
-        "提交约束/合规规则提案",
-        {"subject": _param(**P), "name": _param(), "kind": _param(), "expression": _param(**P), "severity": _param(), "reg_ref": _param(), "property": _param(), "description": _param(), "confidence": _param(type="number")},
-        _onto_propose_constraint,
-        category="ontology",
-        risk="write",
-    )
-    R.register(
-        "ontology.propose_update",
-        "提交对已有对象类型的更新提案（补定义/补属性/补注解）",
-        {"label": _param(**P), "patch": _param(type="object", **P, description='例如 {"definition": "...", "properties": [...]}'), "rationale": _param(), "confidence": _param(type="number")},
-        _onto_propose_update,
-        category="ontology",
-        risk="write",
-    )
-    R.register("ontology.validate", "对本体空间做一致性校验", {}, _onto_validate, category="ontology")
-    R.register("ontology.export", "导出本体序列化结果", {"format": _param(enum=["turtle", "skos", "jsonschema"]), "type_id": _param(type="integer")}, _onto_export, category="ontology")
-
-    R.register("graph.subgraph", "查询以某对象类型为中心的知识图谱子图", {"label": _param(), "type_id": _param(type="integer"), "depth": _param(type="integer")}, _graph_subgraph, category="graph")
-    R.register("graph.stats", "查看图谱规模、枢纽节点与覆盖缺口", {}, _graph_stats, category="graph")
-
-    R.register("wiki.draft_page", "为某对象类型生成 Wiki 页面草稿（进入待确认提案）", {"topic": _param(**P), "definition": _param()}, _wiki_draft_page, category="wiki", risk="write")
-    R.register("wiki.read_page", "读取已编译的 Wiki 页面", {"slug": _param(**P)}, _wiki_read_page, category="wiki")
-
-    R.register("memory.remember", "把一条结论写入长期记忆", {"content": _param(**P), "kind": _param(enum=["fact", "pattern", "preference", "decision", "glossary"])}, _memory_remember, category="memory", risk="write")
-    R.register("memory.recall", "从长期记忆召回相关经验", {"query": _param(**P), "top_k": _param(type="integer")}, _memory_recall, category="memory")
-
-    R.register("sandbox.run_python", "在受限沙箱中执行 Python 计算（白名单模块、无网络无文件、超时终止）", {"code": _param(**P), "timeout": _param(type="integer")}, _sandbox_run, category="exec", risk="exec")
-    R.register("search.web", "联网检索公开资料", {"query": _param(**P), "top_k": _param(type="integer")}, _search_web, category="network", risk="network")
-    R.register("search.fetch", "抓取网页正文", {"url": _param(**P), "max_chars": _param(type="integer")}, _search_fetch, category="network", risk="network")
-    R.register("datasource.describe", "列出数据源中的表与列", {"uri": _param(**P)}, _datasource_describe, category="data")
-    R.register("datasource.profile", "剖析数据源表结构（空值率、基数、数值占比、样例值）", {"uri": _param(**P)}, _datasource_profile, category="data")
-
-
-def register_mcp_tools() -> int:
-    """把 MCP 服务器的工具动态注册进工具表。"""
-    count = 0
-    for tool in mcp_manager.tools():
-        qualified = tool.qualified
-        if registry_tools.has(qualified):
-            continue
-        parameters = {
-            key: _param(type=value.get("type", "string"), required=bool(value.get("required")))
-            for key, value in (tool.parameters or {}).items()
-        }
-
-        async def handler(ctx: ToolContext, args: dict[str, Any], _q: str = qualified) -> dict:
-            return await _mcp_fallback(ctx, _q, args)
-
-        registry_tools.register(qualified, f"[MCP:{tool.server}] {tool.description}", parameters, handler, category="mcp", risk="read")
-        count += 1
-    return count
-
-
-def _as_list(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(v) for v in value]
-    if isinstance(value, str) and value.strip():
-        return [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
-    return []
+    R.register("doc.list", "列出当前空间已入库的文档",
+               {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}}},
+               _doc_list, category="doc", risk="read")
+    R.register("doc.chunks", "查看文档片段（用于取证）",
+               {"type": "object", "properties": {"document_id": {"type": "integer"}, "limit": {"type": "integer", "default": 8}}},
+               _doc_chunks, category="doc", risk="read")
+    R.register("ontology.list_types", "列出当前空间的对象类型",
+               {"type": "object", "properties": {"keyword": {"type": "string"}, "limit": {"type": "integer", "default": 30}}},
+               _ontology_list_types, category="ontology", risk="read")
+    R.register("ontology.type_detail", "查看某个对象类型的完整定义",
+               {"type": "object", "properties": {"type_id": {"type": "integer"}}, "required": ["type_id"]},
+               _ontology_type_detail, category="ontology", risk="read")
+    R.register("find_similar", "检查某个标签是否与已有类型重复",
+               {"type": "object", "properties": {"label": {"type": "string"}, "aliases": {"type": "array", "items": {"type": "string"}}},
+                "required": ["label"]},
+               _find_similar, category="ontology", risk="read")
+    R.register("propose_type", "产出「新建对象类型」提案（需人工确认，不直接写本体）",
+               {"type": "object", "properties": {"draft": {"type": "object"}, "rationale": {"type": "string"}},
+                "required": ["draft"]},
+               _propose_type, category="ontology", risk="write")
+    R.register("graph.subgraph", "查询图谱邻域或整体洞察",
+               {"type": "object", "properties": {"node_id": {"type": "string"}, "depth": {"type": "integer", "default": 1}}},
+               _graph_subgraph, category="graph", risk="read")
+    R.register("wiki.list_pages", "列出 Wiki 页面",
+               {"type": "object", "properties": {"page_type": {"type": "string"}, "limit": {"type": "integer", "default": 20}}},
+               _wiki_list_pages, category="wiki", risk="read")
+    R.register("wiki.read_page", "读取某个 Wiki 页面正文",
+               {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]},
+               _wiki_read_page, category="wiki", risk="read")
+    R.register("memory.search", "检索长期记忆",
+               {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 5}}},
+               _memory_search, category="memory", risk="read")
+    R.register("memory.save", "写入一条长期记忆",
+               {"type": "object", "properties": {"content": {"type": "string"}, "kind": {"type": "string", "default": "fact"},
+                                                 "keywords": {"type": "string"}},
+                "required": ["content"]},
+               _memory_save, category="memory", risk="write")
+    R.register("sandbox.run_python", "在受限沙箱中运行 Python（仅允许白名单标准库）",
+               {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]},
+               _sandbox_run, category="sandbox", risk="exec")
+    R.register("search.web", "联网搜索（默认关闭，需在组件中心启用）",
+               {"type": "object", "properties": {"query": {"type": "string"}, "top_k": {"type": "integer", "default": 5}},
+                "required": ["query"]},
+               _search_web, category="search", risk="network")
+    R.register("datasource.probe", "探查数据源结构（URI 前缀自动路由）",
+               {"type": "object", "properties": {"uri": {"type": "string"}}, "required": ["uri"]},
+               _datasource_probe, category="datasource", risk="network")
 
 
 _register_builtin()
+
+
+def registry() -> ToolRegistry:
+    return R
+
+
+def parse_arguments(raw: str) -> dict:
+    """LLM 给出的参数可能是 JSON、也可能带注释；解析失败返回 {}。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {"value": parsed}
+    except json.JSONDecodeError:
+        pass
+    start, end = raw.find("{"), raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(raw[start : end + 1])
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}

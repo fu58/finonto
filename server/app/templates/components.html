@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}组件中心{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>组件中心</h1>
+    <p class="muted">
+      10 类外部依赖全部可插拔。免密钥实现是<strong>一等公民</strong>（功能完整，不是占位）；
+      「设为生效」写入 <code>{{ components_file }}</code>，重启后仍生效。密钥只回显是否已配置。
+    </p>
+  </header>
+  <div class="filter-row">
+    <button class="btn primary" data-get="/api/components/probe/all" data-render="probes">全部探针</button>
+    <a class="btn" href="/api/components" target="_blank">目录 JSON</a>
+    <a class="btn" href="/api/components/secrets" target="_blank">密钥状态</a>
+    <a class="btn" href="/api/components/deploy" target="_blank">部署清单</a>
+  </div>
+  <div id="probes" class="probe-grid"></div>
+</section>
+
+{% for category in categories %}
+<section class="panel">
+  <header class="panel-head">
+    <h2>{{ category.label }}</h2>
+    <span class="muted small">
+      当前生效：<code>{{ category.active }}</code> · 配置项 <code>FINONTO_{{ category.key|upper }}</code>
+    </span>
+  </header>
+  <div class="comp-grid">
+    {% for entry in category.entries %}
+    <article class="comp-card {% if entry.active %}active{% endif %}">
+      <header>
+        <strong>{{ entry.display }}</strong>
+        {% if entry.active %}<span class="badge ok">生效中</span>{% endif %}
+        {% if entry.needs_key %}
+          <span class="badge {{ 'ok' if entry.key_configured else 'warn' }}">{{ '已配置密钥' if entry.key_configured else '需密钥' }}</span>
+        {% else %}
+          <span class="badge ghost">免密钥</span>
+        {% endif %}
+      </header>
+      <p class="muted small">{{ entry.note }}</p>
+      <code class="small">{{ entry.key }}</code>
+      <footer>
+        {% if not entry.active %}
+        <form method="post" action="/components/activate?space={{ space_id }}"
+              data-confirm="切换 {{ category.label }} 到「{{ entry.display }}」？需要重启服务生效。">
+          <input type="hidden" name="category" value="{{ category.key }}"/>
+          <input type="hidden" name="key" value="{{ entry.key }}"/>
+          <button class="btn tiny primary" type="submit">设为生效</button>
+        </form>
+        {% endif %}
+        <button class="btn tiny" data-get="/api/components/probe?category={{ category.key }}&key={{ entry.key }}"
+                data-render="probe-{{ category.key }}-{{ loop.index }}">探针</button>
+      </footer>
+      <pre class="code-block tiny" id="probe-{{ category.key }}-{{ loop.index }}" hidden></pre>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endfor %}
+
+<section class="panel">
+  <header class="panel-head"><h2>接真实模型的最小改动</h2></header>
+  <pre class="code-block"># server/.env
+FINONTO_LLM_PROVIDER=openai_compat:dashscope
+FINONTO_LLM_API_KEY=sk-xxxx
+FINONTO_LLM_MODEL=qwen-plus
+FINONTO_EMBEDDING_PROVIDER=openai_compat
+FINONTO_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+FINONTO_EMBEDDING_API_KEY=sk-xxxx
+FINONTO_EMBEDDING_DIM=1024
+FINONTO_RERANK_PROVIDER=llm</pre>
+  <p class="muted small">换 embedding 后必须到「文档入库」逐篇重建索引 —— 维度与语义空间不同，不能混用旧向量。</p>
+</section>
+{% endblock %}

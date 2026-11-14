@@ -1,229 +1,199 @@
-"""Wiki 接口：页面列表/详情、人工编辑与锁、版本历史/diff/回滚、增量编译、知识图谱。"""
+"""Wiki 与图谱接口：页面、版本、diff、回滚、编译、图谱四种模式。"""
 
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi.responses import PlainTextResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..core.wiki.compiler import WikiCompiler
-from ..core.wiki.graph import GraphService
-from ..core.wiki.versions import VersionService
-from ..db import get_session
-from ..models import WikiPage
+from ..core.wiki import compiler, graph as graph_service, versions
+from ..db import get_db
+from ..models import OntologySpace, WikiPage
 
 router = APIRouter(prefix="/api/wiki", tags=["wiki"])
 
 
-def _page(session: Session, page_id: int) -> WikiPage:
-    page = session.get(WikiPage, page_id)
-    if page is None:
-        raise HTTPException(404, f"页面 {page_id} 不存在")
-    return page
-
-
-# ------------------------------------------------------------------ 页面
+# --------------------------------------------------------------------------- #
+# 页面
+# --------------------------------------------------------------------------- #
 @router.get("/pages")
-def pages(space_id: int = 1, session: Session = Depends(get_session)) -> dict[str, Any]:
-    compiler = WikiCompiler(session)
-    rows = compiler.list_pages(space_id)
+def list_pages(
+    space_id: int = Query(..., alias="space"),
+    page_type: str = Query(""),
+    keyword: str = Query(""),
+    only_dirty: bool = Query(False),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    query = select(WikiPage).where(WikiPage.space_id == space_id)
+    if page_type:
+        query = query.where(WikiPage.page_type == page_type)
+    if only_dirty:
+        query = query.where(WikiPage.is_dirty.is_(True))
+    rows = db.execute(query.order_by(WikiPage.page_type, WikiPage.slug)).scalars().all()
+    if keyword:
+        needle = keyword.strip().lower()
+        rows = [
+            row for row in rows
+            if needle in (row.title or "").lower() or needle in (row.body or "").lower()
+        ]
     return {
-        "total": len(rows),
         "pages": [
             {
-                "id": page.id,
-                "slug": page.slug,
-                "title": page.title,
-                "page_type": page.page_type,
-                "object_type_id": page.object_type_id,
-                "current_version": page.current_version,
-                "locked_by_human": page.locked_by_human,
-                "dirty": page.dirty,
-                "revision_count": len(page.revisions),
-                "updated_at": page.updated_at.isoformat() if page.updated_at else "",
+                "id": row.id,
+                "slug": row.slug,
+                "page_type": row.page_type,
+                "title": row.title,
+                "version": row.version,
+                "is_dirty": row.is_dirty,
+                "is_locked": row.is_locked,
+                "size": len(row.body or ""),
+                "updated_at": row.updated_at.isoformat(sep=" ", timespec="seconds"),
             }
-            for page in rows
+            for row in rows
         ],
+        "count": len(rows),
     }
 
 
 @router.get("/pages/{page_id}")
-def page_detail(page_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
-    return _detail(session, _page(session, page_id))
-
-
-@router.get("/by-slug")
-def page_by_slug(slug: str, space_id: int = 1, session: Session = Depends(get_session)) -> dict[str, Any]:
-    for page in WikiCompiler(session).list_pages(space_id):
-        if page.slug == slug:
-            return _detail(session, page)
-    raise HTTPException(404, f"slug {slug} 不存在")
-
-
-def _detail(session: Session, page: WikiPage) -> dict[str, Any]:
-    view = WikiCompiler(session).page_view(page)
-    view["revisions"] = VersionService(session).revisions(page.id)
-    return view
-
-
-@router.post("/spaces/{space_id}/compile")
-def compile_space(
-    space_id: int,
-    only_dirty: bool = False,
-    force: bool = False,
-    session: Session = Depends(get_session),
-) -> dict[str, Any]:
-    """重编译。only_dirty 走增量；force 忽略人工锁。"""
-    try:
-        report = WikiCompiler(session).compile_space(space_id, only_dirty=only_dirty, force=force)
-    except KeyError as exc:
-        raise HTTPException(404, str(exc)) from exc
+def page_detail(page_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    page = db.get(WikiPage, page_id)
+    if page is None:
+        raise HTTPException(status_code=404, detail="页面不存在")
     return {
-        "created": report.created,
-        "updated": report.updated,
-        "unchanged": report.unchanged,
-        "skipped_locked": report.skipped_locked,
-        "pages": report.pages,
+        "id": page.id,
+        "slug": page.slug,
+        "page_type": page.page_type,
+        "title": page.title,
+        "body": page.body,
+        "version": page.version,
+        "is_dirty": page.is_dirty,
+        "is_locked": page.is_locked,
+        "revisions": versions.list_revisions(db, page_id),
     }
 
 
-# ------------------------------------------------------------------ 人工编辑
-@router.put("/pages/{page_id}")
-async def edit_page(page_id: int, body: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
-    body_md = str(body.get("body_md", ""))
-    if not body_md.strip():
-        raise HTTPException(400, "body_md 不能为空")
-    try:
-        result = WikiCompiler(session).manual_edit(
-            page_id,
-            body_md,
-            note=str(body.get("note", "")),
-            author=str(body.get("author", "human")),
-            lock=bool(body.get("lock", True)),
-        )
-    except KeyError as exc:
-        raise HTTPException(404, str(exc)) from exc
-    if result["revision"] is None:
-        session.commit()
-        return {"changed": False, **result}
-    session.commit()
-    return {"changed": True, **result}
+@router.get("/pages/by-slug/{slug}")
+def page_by_slug(slug: str, space_id: int = Query(..., alias="space"), db: Session = Depends(get_db)):
+    page = db.execute(
+        select(WikiPage).where(WikiPage.space_id == space_id, WikiPage.slug == slug)
+    ).scalars().first()
+    if page is None:
+        raise HTTPException(status_code=404, detail="页面不存在")
+    return page_detail(page.id, db)
 
 
-@router.post("/pages/{page_id}/lock")
-def set_lock(page_id: int, locked: bool = True, session: Session = Depends(get_session)) -> dict[str, Any]:
-    try:
-        return WikiCompiler(session).set_lock(page_id, locked)
-    except KeyError as exc:
-        raise HTTPException(404, str(exc)) from exc
-
-
-# ------------------------------------------------------------------ 版本
-@router.get("/pages/{page_id}/revisions")
-def revisions(page_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
-    _page(session, page_id)
-    return {"page_id": page_id, "revisions": VersionService(session).revisions(page_id)}
-
-
-@router.get("/pages/{page_id}/revisions/{version_no}")
-def revision_detail(page_id: int, version_no: int, session: Session = Depends(get_session)) -> dict[str, Any]:
-    revision = VersionService(session).get_revision(page_id, version_no)
-    if revision is None:
-        raise HTTPException(404, f"版本 v{version_no} 不存在")
-    return {
-        "id": revision.id,
-        "page_id": page_id,
-        "version_no": revision.version_no,
-        "author": revision.author,
-        "change_note": revision.change_note,
-        "summary": revision.summary,
-        "body_md": revision.body_md,
-        "created_at": revision.created_at.isoformat() if revision.created_at else "",
-    }
-
-
-@router.get("/pages/{page_id}/diff")
-def diff(page_id: int, left: int, right: int | None = None, session: Session = Depends(get_session)) -> dict[str, Any]:
-    try:
-        return VersionService(session).diff(page_id, left, right)
-    except KeyError as exc:
-        raise HTTPException(404, str(exc)) from exc
-
-
-@router.post("/pages/{page_id}/rollback")
-def rollback(page_id: int, body: dict[str, Any], session: Session = Depends(get_session)) -> dict[str, Any]:
-    """回滚是非破坏式的：不删除历史，而是把目标版本内容追加为新版本。"""
-    if body.get("to_version") is None:
-        raise HTTPException(400, "to_version 必填")
-    try:
-        result = VersionService(session).rollback(
-            page_id,
-            int(body["to_version"]),
-            actor=str(body.get("actor", "human")),
-            note=str(body.get("note", "")),
-        )
-    except KeyError as exc:
-        raise HTTPException(404, str(exc)) from exc
+@router.post("/pages/{page_id}/edit")
+def edit_page(page_id: int, payload: dict = Body(...), db: Session = Depends(get_db)) -> dict[str, Any]:
+    result = versions.save_manual_edit(
+        db,
+        page_id,
+        payload.get("body", ""),
+        author=payload.get("author", "manual"),
+        message=payload.get("message", "人工编辑"),
+        title=payload.get("title"),
+    )
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="页面不存在")
     return result
 
 
-@router.delete("/pages/{page_id}/revisions/{version_no}")
-def delete_revision(page_id: int, version_no: int, session: Session = Depends(get_session)) -> dict[str, Any]:
-    try:
-        removed = VersionService(session).delete_revision(page_id, version_no)
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    if not removed:
-        raise HTTPException(404, f"版本 v{version_no} 不存在")
-    return {"removed": version_no}
+@router.post("/pages/{page_id}/lock")
+def lock_page(page_id: int, payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    locked = bool(payload.get("locked", True))
+    result = versions.toggle_lock(db, page_id, locked)
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="页面不存在")
+    return result
 
 
-# ------------------------------------------------------------------ 图谱
+@router.get("/pages/{page_id}/revisions")
+def revisions(page_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return {"revisions": versions.list_revisions(db, page_id)}
+
+
+@router.get("/pages/{page_id}/diff")
+def diff(
+    page_id: int,
+    left: int = Query(...),
+    right: int = Query(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    result = versions.diff_versions(db, page_id, left, right)
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="版本不存在")
+    return result
+
+
+@router.post("/pages/{page_id}/rollback")
+def rollback(page_id: int, payload: dict = Body(...), db: Session = Depends(get_db)) -> dict[str, Any]:
+    version = int(payload.get("version", 1))
+    result = versions.rollback(db, page_id, version, actor=payload.get("actor", "manual"))
+    if result.get("status") == "missing":
+        raise HTTPException(status_code=404, detail="页面不存在")
+    if result.get("status") == "version_missing":
+        raise HTTPException(status_code=404, detail=f"版本不存在：v{version}")
+    return result
+
+
+@router.post("/compile")
+def compile_pages(
+    space_id: int = Query(..., alias="space"),
+    only_dirty: bool = Query(False),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if db.get(OntologySpace, space_id) is None:
+        raise HTTPException(status_code=404, detail="空间不存在")
+    return compiler.compile_space(db, space_id, only_dirty=only_dirty, message="手动触发编译")
+
+
+# --------------------------------------------------------------------------- #
+# 图谱
+# --------------------------------------------------------------------------- #
 @router.get("/graph")
-def graph(
-    space_id: int = 1,
-    include_properties: bool = False,
-    include_docs: bool = False,
-    domain: str | None = None,
-    status: str | None = None,
-    session: Session = Depends(get_session),
+def graph_data(
+    space_id: int = Query(..., alias="space"),
+    layout: bool = Query(True),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    return GraphService(session).build(
-        space_id,
-        include_properties=include_properties,
-        include_docs=include_docs,
-        domain=domain,
-        status=[s for s in status.split(",") if s] if status else None,
-    )
+    graph = graph_service.build_graph(db, space_id)
+    if layout:
+        graph = graph_service.layout(graph)
+    return graph
 
 
-@router.get("/graph/subgraph")
+@router.get("/graph.svg")
+def graph_svg(space_id: int = Query(..., alias="space"), db: Session = Depends(get_db)):
+    graph = graph_service.layout(graph_service.build_graph(db, space_id))
+    return PlainTextResponse(graph_service.to_svg(graph), media_type="image/svg+xml")
+
+
+@router.get("/subgraph")
 def subgraph(
-    center_type_id: int,
-    space_id: int = 1,
-    depth: int = 2,
-    include_properties: bool = False,
-    session: Session = Depends(get_session),
+    space_id: int = Query(..., alias="space"),
+    node: str = Query(...),
+    depth: int = Query(1),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    if depth < 1 or depth > 6:
-        raise HTTPException(400, "depth 需在 1~6 之间")
-    return GraphService(session).subgraph(
-        space_id, center_type_id, depth=depth, include_properties=include_properties
-    )
+    graph = graph_service.layout(graph_service.build_graph(db, space_id))
+    return graph_service.subgraph(graph, node, depth)
 
 
-@router.get("/graph/path")
-def graph_path(
-    start_type_id: int,
-    end_type_id: int,
-    space_id: int = 1,
-    max_hops: int = 6,
-    session: Session = Depends(get_session),
+@router.get("/path")
+def path(
+    space_id: int = Query(..., alias="space"),
+    source: str = Query(..., alias="from"),
+    target: str = Query(..., alias="to"),
+    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    return GraphService(session).path(space_id, start_type_id, end_type_id, max_hops=max_hops)
+    graph = graph_service.build_graph(db, space_id)
+    return graph_service.shortest_path(graph, source, target)
 
 
-@router.get("/graph/insights")
-def graph_insights(space_id: int = 1, session: Session = Depends(get_session)) -> dict[str, Any]:
-    return GraphService(session).insights(space_id)
+@router.get("/insights")
+def insights(space_id: int = Query(..., alias="space"), db: Session = Depends(get_db)) -> dict[str, Any]:
+    graph = graph_service.build_graph(db, space_id)
+    return graph_service.insights(db, space_id, graph)

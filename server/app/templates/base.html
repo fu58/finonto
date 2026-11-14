@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{% block title %}{{ APP_NAME }}{% endblock %} · {{ APP_NAME }}</title>
+  <link rel="stylesheet" href="/static/css/app.css"/>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/?space={{ space_id }}">
+    <strong>FinOnto</strong><span>引导式本体生成</span>
+  </a>
+
+  <form class="space-switch" method="get" action="{{ current_path or '/' }}">
+    <label for="space-select">本体空间</label>
+    <select id="space-select" name="space" data-autosubmit>
+      {% for item in spaces %}
+      <option value="{{ item.id }}" {% if space and item.id == space.id %}selected{% endif %}>
+        {{ item.name }} · {{ item.domain_label }}
+      </option>
+      {% else %}
+      <option value="0">尚未安装领域包</option>
+      {% endfor %}
+    </select>
+  </form>
+
+  <div class="topbar-meta">
+    {% if summary %}
+    <span class="pill">{{ summary.types }} 类型</span>
+    <span class="pill">{{ summary.links }} 关联</span>
+    {% if summary.pending_proposals %}
+    <a class="pill warn" href="/proposals?space={{ space_id }}">{{ summary.pending_proposals }} 待确认</a>
+    {% endif %}
+    {% endif %}
+    {% if user %}
+    <span class="user-chip" title="{{ user.display_name or user.username }}">
+      <span class="avatar">{{ (user.display_name or user.username)[0] }}</span>
+      <span class="user-meta">
+        <strong>{{ user.username }}</strong>
+        <span class="badge {{ 'ok' if role == 'admin' else 'info' if role == 'approver' else 'ghost' }}">{{ role_label }}</span>
+      </span>
+    </span>
+    {% if user.must_change_password %}
+    <a class="pill warn" href="/profile?space={{ space_id }}">请修改初始密码</a>
+    {% endif %}
+    <a class="btn tiny" href="/logout">退出</a>
+    {% endif %}
+    <span class="pill ghost">{{ VERSION }}</span>
+  </div>
+</header>
+
+{% if not auth_enabled %}
+<div class="banner warn">
+  <strong>演示模式</strong>：认证已关闭（<code>FINONTO_AUTH_ENABLED=false</code>），所有请求按管理员处理。
+  对外暴露前请开启认证并修改初始密码。
+</div>
+{% elif user and user.must_change_password %}
+<div class="banner warn">
+  <strong>安全提示</strong>：当前账号仍在使用初始密码，请前往
+  <a href="/profile?space={{ space_id }}">账号设置</a> 修改后再投入使用。
+</div>
+{% endif %}
+
+<div class="layout">
+  <nav class="sidenav">
+    {% for item in nav %}
+    <a class="nav-item {% if active == item.key %}active{% endif %}"
+       href="{{ item.href }}{% if '?' in item.href %}&{% else %}?{% endif %}space={{ space_id }}">
+      <span class="dot dot-{{ item.key }}"></span>{{ item.label }}
+    </a>
+    {% endfor %}
+    <div class="sidenav-foot">
+      <a href="/api/health" target="_blank">/api/health</a>
+      <span>request-id：{{ request_id or '-' }}</span>
+      <span>Python 单栈 · 零密钥可跑</span>
+    </div>
+  </nav>
+
+  <main class="content">
+    {% block content %}{% endblock %}
+  </main>
+</div>
+
+<div id="toast-root" class="toast-root" aria-live="polite"></div>
+<script src="/static/js/ui.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

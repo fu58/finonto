@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}知识图谱{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>知识图谱</h1>
+    <p class="muted">
+      节点 <code>t:</code> 对象类型 · <code>p:</code> 数据属性 · <code>d:</code> 文档；
+      边分分类 / 关联 / 属性 / 证据四类。布局在 Python 里用 numpy 迭代，坐标确定，可进版本 diff。
+    </p>
+  </header>
+  <form class="filter-row" method="get" action="/graph">
+    <input type="hidden" name="space" value="{{ space_id }}"/>
+    <select name="mode">
+      <option value="full" {% if mode == 'full' %}selected{% endif %}>全图</option>
+      <option value="neighborhood" {% if mode == 'neighborhood' %}selected{% endif %}>邻域子图</option>
+      <option value="path" {% if mode == 'path' %}selected{% endif %}>两点路径</option>
+    </select>
+    <input name="node" value="{{ focus or '' }}" placeholder="节点 id，如 t:3"/>
+    <input name="from" value="{{ source or '' }}" placeholder="起点 from"/>
+    <input name="to" value="{{ target or '' }}" placeholder="终点 to"/>
+    <button class="btn primary" type="submit">查询</button>
+    <a class="btn" href="/api/wiki/graph.svg?space={{ space_id }}" target="_blank">导出 SVG</a>
+  </form>
+  <div class="graph-legend">
+    <span><i class="lg lg-taxonomy"></i>分类</span>
+    <span><i class="lg lg-association"></i>关联</span>
+    <span><i class="lg lg-attribute"></i>属性</span>
+    <span><i class="lg lg-evidence"></i>证据</span>
+    <span class="muted small">拖拽平移 · 滚轮缩放 · 点击节点查看邻域</span>
+  </div>
+</section>
+
+<div class="split">
+  <section class="panel">
+    <div class="graph-wrap" id="graph-wrap" data-space="{{ space_id }}">
+      {{ svg }}
+    </div>
+    {% if path %}
+    <h3>最短路径（{{ path.length }} 跳）</h3>
+    <div class="list compact">
+      {% for step in path.steps %}
+      <div class="row">
+        <div class="row-main">{{ step.from }} — <span class="badge ghost">{{ step.label }}</span> → {{ step.to }}</div>
+      </div>
+      {% endfor %}
+      {% if not path.steps %}<p class="muted">未找到路径。</p>{% endif %}
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="panel side">
+    <header class="panel-head"><h2>图谱洞察</h2></header>
+    <div class="stat-grid">
+      <div class="stat"><span>节点</span><strong>{{ insights.node_count }}</strong></div>
+      <div class="stat"><span>关系</span><strong>{{ insights.edge_count }}</strong></div>
+      <div class="stat"><span>类型</span><strong>{{ insights.type_count }}</strong></div>
+      <div class="stat"><span>密度</span><strong>{{ insights.density }}</strong></div>
+      <div class="stat"><span>平均度</span><strong>{{ insights.avg_degree }}</strong></div>
+      <div class="stat"><span>连通分量</span><strong>{{ insights.components }}</strong></div>
+    </div>
+
+    <h3>枢纽节点</h3>
+    <div class="list compact">
+      {% for hub in insights.hubs %}
+      <a class="row link-row" href="/graph?space={{ space_id }}&mode=neighborhood&node={{ hub.id }}">
+        <div class="row-main">{{ hub.label }}</div>
+        <div class="row-meta"><span class="badge ghost">度 {{ hub.degree }}</span></div>
+      </a>
+      {% endfor %}
+    </div>
+
+    <h3>业务域分布</h3>
+    {% for item in insights.domains %}
+    <div class="bar-row">
+      <span>{{ item.domain }}</span>
+      <div class="bar"><i style="width: {{ (item.count / (insights.type_count or 1) * 100) | round(1) }}%"></i></div>
+      <span class="muted small">{{ item.count }}</span>
+    </div>
+    {% endfor %}
+
+    <h3>缺证据类型（{{ insights.no_evidence|length }}）</h3>
+    <div class="chips">
+      {% for item in insights.no_evidence %}
+      <span class="chip static">{{ item.label }}</span>
+      {% endfor %}
+    </div>
+
+    <h3>孤立节点（{{ insights.isolated|length }}）</h3>
+    <div class="chips">
+      {% for item in insights.isolated %}
+      <span class="chip static">{{ item.label }}</span>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/graph.js"></script>
+{% endblock %}

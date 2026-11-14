@@ -1,34 +1,36 @@
-"""SSE 工具：手写事件帧，避免额外依赖。"""
+"""SSE 编码工具。
+
+格式：每条事件一行 ``data: <json>\\n\\n``（不自定义 event 名，前端只需一个 onmessage）。
+为什么用 SSE 而不是 WebSocket：本项目是单向推送（服务端→浏览器），SSE 走普通 HTTP，
+代理/网关配置简单，断线由浏览器自动重连。
+"""
 
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
-from typing import Any
+from typing import AsyncIterator, Iterable, Iterator
 
-from fastapi.responses import StreamingResponse
+from starlette.responses import StreamingResponse
 
 SSE_HEADERS = {
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
+    "X-Accel-Buffering": "no",  # 关闭 Nginx 缓冲，否则 token 会被攒着一次性下发
 }
 
 
-def sse_frame(event: str, data: Any) -> str:
-    payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str)
-    return f"event: {event}\ndata: {payload}\n\n"
+def encode(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
 
 
-def sse_response(events: AsyncIterator[dict[str, Any]]) -> StreamingResponse:
-    """把事件字典流封装成 text/event-stream；每个事件自带 type 字段。"""
-
-    async def body() -> AsyncIterator[str]:
+def sse_response(events: Iterable[dict]) -> StreamingResponse:
+    def generator() -> Iterator[str]:
         try:
-            async for event in events:
-                yield sse_frame(str(event.get("type", "message")), event)
-        except Exception as exc:  # noqa: BLE001  流内异常要作为事件送出，否则客户端只能看到连接中断
-            yield sse_frame("error", {"type": "error", "message": f"{type(exc).__name__}: {exc}"})
-        yield "event: close\ndata: {}\n\n"
+            for event in events:
+                yield encode(event)
+        except Exception as exc:  # noqa: BLE001 - 流中异常也要变成一条事件
+            yield encode({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+        finally:
+            yield "data: [DONE]\n\n"
 
-    return StreamingResponse(body(), media_type="text/event-stream", headers=SSE_HEADERS)
+    return StreamingResponse(generator(), media_type="text/event-stream", headers=SSE_HEADERS)

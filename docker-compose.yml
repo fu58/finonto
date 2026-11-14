@@ -1,33 +1,56 @@
-# 单机部署：docker compose up -d   （访问 http://127.0.0.1:8000）
-# 默认全部使用本地实现（零密钥）。要接真实模型/向量库，改 environment 后重启即可。
+# FinOnto · 单机编排
+#   零密钥默认：docker compose up -d
+#   换 pgvector：docker compose --profile pgvector up -d
+#     （同时设置 FINONTO_VECTOR_STORE=pgvector 与 FINONTO_DATABASE_URL 指向 pg）
 services:
   finonto:
     build: .
-    image: finonto:0.1.0
+    image: finonto:0.1
+    container_name: finonto
     ports:
       - "8000:8000"
     environment:
-      FINONTO_DATA_DIR: /app/data
+      FINONTO_ENV: prod
       FINONTO_AUTO_BOOTSTRAP: "true"
-      # 接真实模型时取消注释（镜像内需自行 pip install 相应 SDK）
+      FINONTO_DATA_DIR: /app/server/var
+      FINONTO_VECTOR_STORE: ${FINONTO_VECTOR_STORE:-sqlite_numpy}
+      # 认证默认开启；初始管理员密码务必通过环境变量覆盖（不要把 admin123 带上生产）
+      FINONTO_AUTH_ENABLED: ${FINONTO_AUTH_ENABLED:-true}
+      FINONTO_ADMIN_PASSWORD: ${FINONTO_ADMIN_PASSWORD:-admin123}
+      FINONTO_COOKIE_SECURE: ${FINONTO_COOKIE_SECURE:-false}
+      FINONTO_RATE_LIMIT_PER_MIN: ${FINONTO_RATE_LIMIT_PER_MIN:-120}
+      # 需要真实模型时把 .env 里的键搬到这里或挂载 env_file
       # FINONTO_LLM_PROVIDER: openai_compat:dashscope
-      # FINONTO_LLM_API_KEY: sk-xxxx
-      # 切换 pgvector 时同时启用 postgres：
-      #   docker compose --profile pgvector up -d
-      # FINONTO_VECTOR_STORE: pgvector
-      # FINONTO_DATABASE_URL: postgresql+psycopg://finonto:finonto@postgres:5432/finonto
+      # FINONTO_LLM_API_KEY: ${DASHSCOPE_API_KEY}
     volumes:
-      - ./data/finonto:/app/data
+      - finonto-data:/app/server/var
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
-  # 可选组件：只在 FINONTO_VECTOR_STORE=pgvector 时需要
-  postgres:
+  # 可选：pgvector 向量库（把 FINONTO_VECTOR_STORE 设为 pgvector 并重建索引）
+  pgvector:
     image: pgvector/pgvector:pg16
+    container_name: finonto-pg
     profiles: ["pgvector"]
     environment:
       POSTGRES_USER: finonto
       POSTGRES_PASSWORD: finonto
       POSTGRES_DB: finonto
+    ports:
+      - "5432:5432"
     volumes:
-      - ./data/pgdata:/var/lib/postgresql/data
-    restart: unless-stopped
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finonto"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  finonto-data:
+  pg-data:

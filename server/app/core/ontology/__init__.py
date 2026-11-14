@@ -1,1 +1,1 @@
-"""FinOnto ontology"""
+"""本体：领域包 / 提案确认 / 唯一 IRI / SHACL 校验 / OWL 导出。"""

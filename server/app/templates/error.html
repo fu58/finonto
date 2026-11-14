@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{{ status }} {{ title }} · FinOnto</title>
+  <link rel="stylesheet" href="/static/css/app.css"/>
+</head>
+<body class="login-page">
+<main class="login-card">
+  <header>
+    <strong class="login-brand">{{ status }}</strong>
+    <p class="muted small">{{ title }}</p>
+  </header>
+  {% if detail %}
+  <div class="banner err">{{ detail }}</div>
+  {% endif %}
+  <div class="ask-actions">
+    <a class="btn primary" href="/">返回首页</a>
+    {% if user %}
+    <a class="btn" href="/logout">退出登录</a>
+    {% else %}
+    <a class="btn" href="/login">去登录</a>
+    {% endif %}
+  </div>
+  <footer class="login-foot">
+    <span>request-id：{{ request_id or '-' }}</span>
+    <span>{{ ip }}</span>
+  </footer>
+</main>
+</body>
+</html>

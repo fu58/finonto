@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+{% block title %}本体工作室{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>本体工作室</h1>
+    <p class="muted">
+      受控词表来自当前领域包：<strong>{{ vocab.label }}</strong> ·
+      子域 {{ vocab.business_domains|join(' / ') or '无' }} ·
+      基线类型 {{ vocab.type_count }} 个
+    </p>
+  </header>
+
+  <form class="filter-row" method="get" action="/ontology">
+    <input type="hidden" name="space" value="{{ space_id }}"/>
+    <input type="search" name="keyword" value="{{ keyword or '' }}" placeholder="搜索类型名 / 定义 / 别名"/>
+    <select name="domain">
+      <option value="">全部子域</option>
+      {% for item in vocab.business_domains %}
+      <option value="{{ item }}" {% if domain == item %}selected{% endif %}>{{ item }}</option>
+      {% endfor %}
+    </select>
+    <select name="kind">
+      <option value="">全部种类</option>
+      {% for item in vocab.kinds %}
+      <option value="{{ item }}" {% if kind == item %}selected{% endif %}>{{ kind_label(item) }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn" type="submit">筛选</button>
+    <button class="btn primary" type="button" data-dialog-open="#create-dialog">新建类型</button>
+    <a class="btn" href="/api/ontology/{{ space_id }}/export?format=turtle" target="_blank">导出 Turtle</a>
+    <a class="btn" href="/api/ontology/{{ space_id }}/export?format=json" target="_blank">JSON Schema</a>
+  </form>
+</section>
+
+<div class="split">
+  <section class="panel side">
+    <header class="panel-head"><h2>对象类型（{{ types|length }}）</h2></header>
+    <div class="list compact">
+      {% for item in types %}
+      <a class="row link-row {% if detail and detail.id == item.id %}active{% endif %}"
+         href="/ontology?space={{ space_id }}&type={{ item.id }}">
+        <div class="row-main">
+          <strong>{{ item.label }}</strong>
+          <span class="muted small">{{ item.definition|shorten(48) }}</span>
+        </div>
+        <div class="row-meta">
+          <span class="badge ghost">{{ item.kind_label }}</span>
+          <span class="muted small">{{ item.property_count }} 属性 · {{ item.link_count }} 关联</span>
+        </div>
+      </a>
+      {% else %}
+      <p class="muted">该空间还没有对象类型。可以安装领域包，或从上方的「新建类型」开始。</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    {% if detail %}
+    <header class="panel-head">
+      <h2>{{ detail.label }}</h2>
+      <div class="row-meta">
+        <span class="badge info">{{ detail.kind_label }}</span>
+        <span class="badge ghost">{{ detail.business_domain or '未分域' }}</span>
+        <span class="badge ghost">置信度 {{ '%.2f'|format(detail.confidence) }}</span>
+        <span class="badge ghost">v{{ detail.version }}</span>
+      </div>
+    </header>
+
+    <form class="stack" method="post" action="/ontology/{{ detail.id }}/definition?space={{ space_id }}">
+      <label>定义（保存后版本 +1，并增量重编译 Wiki）
+        <textarea name="definition" rows="3">{{ detail.definition }}</textarea>
+      </label>
+      <div class="form-grid">
+        <label>业务域
+          <input name="business_domain" value="{{ detail.business_domain }}"/>
+        </label>
+        <label>种类
+          <select name="kind">
+            {% for item in vocab.kinds %}
+            <option value="{{ item }}" {% if detail.kind == item %}selected{% endif %}>{{ kind_label(item) }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <div class="ask-actions">
+        <button class="btn primary" type="submit">保存修改</button>
+        <button class="btn danger" type="submit" formaction="/ontology/{{ detail.id }}/delete?space={{ space_id }}"
+                data-confirm="确认删除该类型？会同时删除其属性、约束与关联。">删除</button>
+      </div>
+    </form>
+
+    <h3>数据属性</h3>
+    {% if detail.properties %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>属性</th><th>类型</th><th>单位</th><th>必填</th><th>枚举</th></tr></thead>
+        <tbody>
+        {% for prop in detail.properties %}
+        <tr>
+          <td>{{ prop.label }}</td>
+          <td>{{ prop.data_type }}</td>
+          <td>{{ prop.unit or '—' }}</td>
+          <td>{{ '是' if prop.required else '否' }}</td>
+          <td class="muted small">{{ prop.enum_values|join('、') or '—' }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<p class="muted">暂无数据属性。</p>{% endif %}
+
+    <h3>关联</h3>
+    {% if detail.links %}
+    <div class="list compact">
+      {% for link in detail.links %}
+      <div class="row">
+        <div class="row-main">
+          <span class="badge ghost">{{ link.relation }}</span>
+          <a href="/ontology?space={{ space_id }}&type={{ link.target_id }}">{{ link.target_label }}</a>
+        </div>
+        <div class="row-meta"><span class="muted small">{{ link.category }} · {{ link.cardinality }}</span></div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}<p class="muted">暂无出边关联。</p>{% endif %}
+
+    <h3>约束（SHACL 风格）</h3>
+    {% if detail.constraints %}
+    <div class="list compact">
+      {% for item in detail.constraints %}
+      <div class="row">
+        <div class="row-main">
+          <span class="badge {{ 'err' if item.severity == '违规' else 'warn' if item.severity == '警告' else 'info' }}">{{ item.severity }}</span>
+          {{ item.message }}
+          <code class="small">{{ item.expression }}</code>
+        </div>
+        <div class="row-meta"><span class="muted small">{{ item.kind }}{% if item.regulation_ref %} · {{ item.regulation_ref }}{% endif %}</span></div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}<p class="muted">暂无约束。</p>{% endif %}
+
+    <h3>证据链</h3>
+    {% if detail.evidence %}
+    <div class="list compact">
+      {% for item in detail.evidence %}
+      <div class="row">
+        <div class="row-main"><span class="muted small">{{ item.locator }}</span>「{{ item.quote }}」</div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}<p class="muted">尚未关联证据。</p>{% endif %}
+    {% else %}
+    <p class="muted">从左侧选择一个类型查看详情。</p>
+    {% endif %}
+  </section>
+</div>
+
+<section class="panel">
+  <header class="panel-head">
+    <h2>空间校验</h2>
+    <button class="btn" data-get="/api/ontology/{{ space_id }}/validate" data-target="#validate-out">运行校验</button>
+  </header>
+  <div id="validate-out" class="list compact"></div>
+</section>
+
+<dialog id="create-dialog" class="dialog">
+  <form method="post" action="/ontology/create?space={{ space_id }}">
+    <header class="panel-head"><h2>新建对象类型</h2></header>
+    <div class="stack">
+      <label>名称 <input name="label" required placeholder="例如：贷后检查计划"/></label>
+      <label>定义 <textarea name="definition" rows="2" placeholder="一句话说明这个概念"></textarea></label>
+      <div class="form-grid">
+        <label>种类
+          <select name="kind">
+            {% for item in vocab.kinds %}
+            <option value="{{ item }}">{{ kind_label(item) }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>业务域
+          <select name="business_domain">
+            <option value="">未分域</option>
+            {% for item in vocab.business_domains %}
+            <option value="{{ item }}">{{ item }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <label>属性（每行一个，格式 <code>名称:类型[:必填]</code>）
+        <textarea name="properties" rows="3" placeholder="检查频率:enum:true&#10;检查结论:string"></textarea>
+      </label>
+    </div>
+    <footer class="dialog-actions">
+      <button type="button" class="btn" data-dialog-close>取消</button>
+      <button type="submit" class="btn primary">创建</button>
+    </footer>
+  </form>
+</dialog>
+{% endblock %}

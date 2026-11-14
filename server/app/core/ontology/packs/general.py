@@ -1,54 +1,39 @@
-"""内置领域包：通用（不预设领域）。
+"""领域包：通用（空白域）。
 
-给「还没打包成领域」的文档用：空白基线 + 中性词表，对象类型完全由文档解析与 Agent 推理产出。
-新建空间时默认落到这里，也是 `pack_for_space` 认不出 `space.domain` 时的回落项。
+不预设任何词表、基线类型与示例语料。两个用途：
+1. 用户新建一个「还没想好领域」的空间时的默认落点；
+2. 遇到 domain 无法识别时的安全回落——绝不能让服务因为「不认识这个领域」而报错。
+
+空白域的价值在于证明：领域能力是**从语料与人工确认里长出来的**，不是靠预置字典撑起来的。
 """
 
 from __future__ import annotations
 
 from .base import DomainPack
 
-SPACE_NAME = "通用本体域"
-
 PACK = DomainPack(
     key="general",
-    label="通用（自定义领域）",
-    summary="不预设领域词表的空白本体域：基线类型为空，对象类型与关联全部由文档解析和 Agent 推理产出。",
-    space_name=SPACE_NAME,
-    space_iri="https://onto.example.com/ontology/general#",
-    space_description="无预设领域的空白本体空间，用于承载任意新领域文档并按需增量建模。",
-    business_domains=["通用", "组织", "流程", "对象", "指标", "规范"],
+    label="通用（未预设领域）",
+    summary="空白域：不预设类型与词表，完全由入库语料 + 人工确认生成。",
+    space_name="通用本体域",
+    space_iri="https://finonto.local/ontology/general",
+    space_description="用于承载尚未归类的知识资产。不预置任何对象类型与术语线索，"
+    "所有类型都来自语料抽取与人工确认，可作为「从零开始建模」的起点。",
+    business_domains=[],
     object_types=[],
     links=[],
     samples=[],
-    facets={
-        "source_refs": "定义出处（文档/条款/章节）",
-        "owner_role": "责任角色",
-        "lifecycle": "生命周期状态",
-        "data_classification": "数据敏感分级",
-    },
-    standards=[],
-    classification={
-        "public": "公开（可对外）",
-        "internal": "内部（组织内可用）",
-        "restricted": "受限（需授权）",
-        "confidential": "机密（最小可见）",
-    },
-    term_suffixes=(
-        "系统", "流程", "角色", "活动", "任务", "记录", "单据", "文档", "规范", "标准",
-        "指标", "阈值", "参数", "资源", "设备", "组件", "事件", "状态", "版本", "清单",
-    ),
-    clause_markers=("应当", "必须", "不得", "仅限", "至少", "不超过"),
-    domain_cues={},
-    tag_cues={},
+    term_suffixes=(),
+    clause_markers=("第", "条", "款"),
+    domain_cues=(),
+    tag_cues=(),
     synonyms={},
+    standards=[],
+    classification=[],
+    facets=[],
     sample_questions=[
-        "这批资料里出现了哪些核心概念，它们之间是什么关系？",
-        "资料里有哪些带数值口径的要求或阈值？",
-        "当前文档中的术语分别属于哪个子域？",
+        "这批文档里反复出现的关键概念有哪些？",
+        "把出现频率最高的三个概念整理成候选对象类型。",
     ],
-    agent_hint=(
-        "建模侧重：这是未预设领域，先从文档里归纳出稳定名词作为对象类型，"
-        "再补父子层级与关联；business_domain 用文档里实际出现的子域名，不要套用其它领域的词表。"
-    ),
+    agent_hint="该空间没有预置词表，请更多依赖语料本身与已有类型。",
 )

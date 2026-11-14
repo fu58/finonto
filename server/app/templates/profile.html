@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}账号设置{% endblock %}
+{% block content %}
+<div class="split">
+  <section class="panel">
+    <header class="panel-head">
+      <h1>账号设置</h1>
+      <p class="muted">修改密码后所有会话会被强制下线（包括当前这个），需要重新登录。</p>
+    </header>
+
+    {% if profile_user and profile_user.must_change_password %}
+    <div class="banner warn">当前仍在用初始密码，请先修改再投入使用。</div>
+    {% endif %}
+    {% if message %}
+    <div class="banner {{ 'err' if message_kind == 'err' else 'info' }}">{{ message }}</div>
+    {% endif %}
+
+    <form method="post" action="/profile/password" class="stack">
+      <label>当前密码 <input name="old_password" type="password" required autocomplete="current-password"/></label>
+      <label>新密码 <input name="new_password" type="password" required autocomplete="new-password" placeholder="至少 8 位，非纯数字"/></label>
+      <div class="ask-actions"><button class="btn primary" type="submit">修改密码</button></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <header class="panel-head"><h2>账号信息</h2></header>
+    <div class="list compact">
+      <div class="row"><div class="row-main">用户名</div><div class="row-meta"><strong>{{ profile_user.username }}</strong></div></div>
+      <div class="row"><div class="row-main">显示名</div><div class="row-meta">{{ profile_user.display_name or '—' }}</div></div>
+      <div class="row"><div class="row-main">角色</div><div class="row-meta"><span class="badge info">{{ role_label }}</span></div></div>
+      <div class="row"><div class="row-main">最近登录</div><div class="row-meta muted small">{{ profile_user.last_login_at or '—' }}</div></div>
+      <div class="row"><div class="row-main">活跃会话</div><div class="row-meta muted small">{{ sessions.active }} / {{ sessions.total }}</div></div>
+    </div>
+    <p class="muted small">
+      账号由管理员在「用户与角色」里维护；忘记密码请让管理员重置，系统不提供自助找回
+      —— 内网工具里自建邮件通道通常比人工重置更不可靠。
+    </p>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block title %}文档入库{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>文档入库</h1>
+    <p class="muted">
+      解析 → 切块 → 嵌入 → BM25 + 向量双索引。同一空间内相同内容（sha256）不会重复入库；
+      当前空间统计：{{ stats.documents }} 份文档 / {{ stats.chunks }} 个片段 / {{ stats.chars }} 字符。
+    </p>
+  </header>
+
+  <div class="two-col">
+    <div>
+      <h3>上传文件</h3>
+      <form id="upload-form" class="stack" data-upload="/api/documents/upload?space={{ space_id }}">
+        <input type="file" id="upload-file" name="file" required/>
+        <div class="form-grid">
+          <label>标题（留空用文件名）<input name="title" placeholder="例如：贷后管理办法"/></label>
+          <label>文种
+            <select name="doc_type">
+              <option>制度</option><option>标准</option><option>合同</option>
+              <option>规程</option><option>手册</option><option>论文</option>
+            </select>
+          </label>
+          <label>发布机构<input name="issuer" placeholder="例如：总行风险管理部"/></label>
+          <label>辖区<input name="jurisdiction" placeholder="例如：集团 / 全国"/></label>
+          <label>权威度（1-5）<input type="number" name="authority" value="3" min="1" max="5"/></label>
+        </div>
+        <p class="muted small">支持 txt / md / csv / json / html / xml / log / docx / xlsx / pdf（PDF 仅文本层）</p>
+        <div class="ask-actions">
+          <button class="btn primary" type="submit">上传并入库</button>
+          <span id="upload-status" class="muted small"></span>
+        </div>
+      </form>
+    </div>
+
+    <div>
+      <h3>纯文本入库</h3>
+      <form class="stack" method="post" action="/documents/text?space={{ space_id }}">
+        <input name="title" placeholder="片段标题" required/>
+        <textarea name="content" rows="6" placeholder="粘贴一段制度条款或说明文字" required></textarea>
+        <div class="ask-actions">
+          <button class="btn primary" type="submit">入库</button>
+        </div>
+      </form>
+      <form class="ask-actions" method="post" action="/documents/reindex?space={{ space_id }}"
+            data-confirm="重建当前空间全部索引？（换 embedding 模型后必须执行）">
+        <button class="btn" type="submit">重建全部索引</button>
+      </form>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>已入库文档（{{ documents|length }}）</h2></header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+      <tr><th>标题</th><th>文种</th><th>发布机构</th><th>权威度</th><th>片段</th><th>状态</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+      {% for item in documents %}
+      <tr>
+        <td>
+          <strong>{{ item.title }}</strong>
+          <div class="muted small">{{ item.filename }} · {{ item.size_bytes }} 字节</div>
+        </td>
+        <td>{{ item.doc_type }}</td>
+        <td class="muted small">{{ item.issuer or '—' }}</td>
+        <td>{{ item.authority }}</td>
+        <td>{{ item.chunks }}</td>
+        <td><span class="badge {{ 'ok' if item.status == 'indexed' else 'warn' }}">{{ item.status }}</span></td>
+        <td class="row-meta">
+          <a class="btn tiny" href="/documents/{{ item.id }}?space={{ space_id }}">片段</a>
+          <form method="post" action="/documents/{{ item.id }}/reindex?space={{ space_id }}">
+            <button class="btn tiny" type="submit">重建索引</button>
+          </form>
+          <form method="post" action="/documents/{{ item.id }}/delete?space={{ space_id }}"
+                data-confirm="删除该文档及其片段与向量？">
+            <button class="btn tiny danger" type="submit">删除</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="muted">还没有文档。安装领域包会带上示例语料，或在上方上传。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% if chunks %}
+<section class="panel">
+  <header class="panel-head">
+    <h2>片段预览 · {{ current_doc.title }}</h2>
+    <span class="muted small">{{ chunks|length }} 个片段</span>
+  </header>
+  <div class="list compact">
+    {% for chunk in chunks %}
+    <div class="row">
+      <div class="row-main">
+        <span class="badge ghost">{{ chunk.locator }}</span>
+        <span class="muted small">{{ chunk.tokens }} tokens</span>
+        <p>{{ chunk.text }}</p>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById("upload-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const fileInput = document.getElementById("upload-file");
+  const file = fileInput?.files?.[0];
+  if (!file) { window.FinOnto.toast("请选择文件", "err"); return; }
+  const params = new URLSearchParams({ filename: file.name });
+  for (const [key, value] of new FormData(form).entries()) {
+    if (key !== "file" && value) params.set(key, value);
+  }
+  const status = document.getElementById("upload-status");
+  status.textContent = "上传中…";
+  const res = await fetch(form.dataset.upload + "&" + params.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: file,
+  });
+  const data = await res.json();
+  if (!res.ok) { status.textContent = data.detail || "失败"; window.FinOnto.toast("入库失败", "err"); return; }
+  status.textContent = `${data.status} · ${data.chunks} 片段 / ${data.chars} 字符`;
+  window.FinOnto.toast(`已入库：${data.title}`, "ok");
+  setTimeout(() => location.reload(), 600);
+});
+</script>
+{% endblock %}

@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}提案审核{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>提案审核</h1>
+    <p class="muted">
+      所有写入都必须在这里人工确认 —— <code>accept_proposal</code> 是全项目唯一能改变本体结构并触发
+      Wiki 增量重编译的入口；RAG 与 Agent 只能产出提案与证据。
+    </p>
+  </header>
+  <div class="filter-row">
+    <a class="btn {% if not status %}primary{% endif %}" href="/proposals?space={{ space_id }}">全部</a>
+    <a class="btn {% if status == 'pending' %}primary{% endif %}" href="/proposals?space={{ space_id }}&status=pending">待确认</a>
+    <a class="btn {% if status == 'accepted' %}primary{% endif %}" href="/proposals?space={{ space_id }}&status=accepted">已采纳</a>
+    <a class="btn {% if status == 'rejected' %}primary{% endif %}" href="/proposals?space={{ space_id }}&status=rejected">已驳回</a>
+  </div>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>提案（{{ proposals|length }}）</h2></header>
+  <div class="list">
+    {% for item in proposals %}
+    <article class="proposal" id="proposal-{{ item.id }}">
+      <header class="proposal-head">
+        <div>
+          <strong>#{{ item.id }} {{ item.payload.label or '(未命名)' }}</strong>
+          <span class="badge info">{{ item.action_label }}</span>
+          <span class="badge {{ 'warn' if item.status == 'pending' else 'ok' if item.status == 'accepted' else 'err' }}">{{ item.status_label }}</span>
+          <span class="badge ghost">{{ item.author }}</span>
+        </div>
+        <span class="muted small">{{ item.created_at }}</span>
+      </header>
+
+      <p class="muted small">{{ item.rationale }}</p>
+
+      <div class="proposal-grid">
+        <div>
+          <h4>草案内容</h4>
+          <pre class="code-block small">{{ item.payload | tojson(indent=2) }}</pre>
+        </div>
+        <div>
+          <h4>证据（{{ item.evidence|length }}）</h4>
+          <div class="list compact">
+            {% for evidence in item.evidence %}
+            <div class="row">
+              <div class="row-main">
+                <span class="muted small">{{ evidence.locator or '未标注定位' }}</span>
+                「{{ evidence.quote|shorten(160) }}」
+              </div>
+            </div>
+            {% else %}
+            <p class="muted small">无证据。建议驳回后让 Agent 先取证。</p>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+
+      {% if item.status == 'pending' %}
+      <form class="ask-actions" method="post" action="/proposals/{{ item.id }}/accept?space={{ space_id }}"
+            data-confirm="确认写入本体？将创建类型并增量重编译 Wiki。">
+        <button class="btn primary" type="submit">确认写入</button>
+        <button class="btn danger" type="submit" formaction="/proposals/{{ item.id }}/reject?space={{ space_id }}"
+                data-confirm="确认驳回该提案？">驳回</button>
+      </form>
+      {% else %}
+      <p class="muted small">处理人：{{ item.decided_by or '—' }} · {{ item.decided_at or '' }}</p>
+      {% endif %}
+    </article>
+    {% else %}
+    <p class="muted">没有符合条件的提案。可以先在「问答」或「Agent 推理」里产出草案。</p>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "fastapi>=0.110" "uvicorn>=0.27" "jinja2>=3.1" \
+            "sqlalchemy>=2.0" "numpy>=1.26" "markupsafe" "pytest>=8"
+
+      - name: Unit tests
+        env:
+          FINONTO_DATA_DIR: server/var-ci
+        run: python -m pytest tests -q
+
+      - name: Service smoke (89 checks)
+        working-directory: server
+        env:
+          FINONTO_DATA_DIR: var-ci
+        run: python scripts/smoke.py
+
+      - name: HTTP + auth smoke (156 checks)
+        working-directory: server
+        env:
+          FINONTO_DATA_DIR: var-ci
+        run: |
+          python scripts/http_smoke.py
+          python scripts/auth_smoke.py
+
+      - name: Preflight (informational)
+        working-directory: server
+        env:
+          FINONTO_DATA_DIR: var-ci
+        run: python scripts/preflight.py || true

@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}领域包{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>领域包</h1>
+    <p class="muted">
+      领域不写死在代码里：每个领域是一个 Python 模块，声明基线本体、受控子域、示例语料与离线抽取线索。
+      安装 = 建空间 → 灌基线 → 语料入库 → 编译 Wiki，**幂等**，反复执行只会跳过已存在项。
+    </p>
+  </header>
+  <form class="filter-row" method="post" action="/packs/bootstrap"
+        data-confirm="安装全部内置领域包？">
+    <button class="btn primary" type="submit">一键安装全部领域包</button>
+    <span class="muted small">也可以逐个安装下面某一张卡片</span>
+  </form>
+</section>
+
+<div class="pack-grid">
+  {% for item in gallery %}
+  <article class="pack-card {% if item.installed %}installed{% endif %}">
+    <header>
+      <h2>{{ item.label }}</h2>
+      <span class="badge {{ 'ok' if item.installed else 'ghost' }}">{{ '已安装' if item.installed else '未安装' }}</span>
+    </header>
+    <p class="muted">{{ item.summary }}</p>
+
+    <div class="stat-grid">
+      <div class="stat"><span>基线类型</span><strong>{{ item.type_count }}</strong></div>
+      <div class="stat"><span>默认关联</span><strong>{{ item.link_count }}</strong></div>
+      <div class="stat"><span>示例语料</span><strong>{{ item.samples_available }}/{{ item.samples|length }}</strong></div>
+      <div class="stat"><span>标准</span><strong>{{ item.standards|length }}</strong></div>
+    </div>
+
+    <div class="chips">
+      {% for domain in item.business_domains %}<span class="chip static">{{ domain }}</span>{% endfor %}
+    </div>
+
+    {% if item.samples %}
+    <details>
+      <summary>示例语料</summary>
+      <ul class="plain">
+        {% for sample in item.samples %}
+        <li>
+          {{ sample.title }}
+          <span class="muted small">{{ sample.doc_type }} · 权威度 {{ sample.authority }}</span>
+          {% if not sample.available %}<span class="badge err">文件缺失</span>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </details>
+    {% endif %}
+
+    {% if item.sample_questions %}
+    <details>
+      <summary>起手问题</summary>
+      <ul class="plain">
+        {% for question in item.sample_questions %}<li>{{ question }}</li>{% endfor %}
+      </ul>
+    </details>
+    {% endif %}
+
+    <footer>
+      <form method="post" action="/packs/{{ item.key }}/install">
+        <button class="btn primary" type="submit">{{ '重新同步' if item.installed else '安装到空间' }}</button>
+      </form>
+      {% if item.space %}
+      <a class="btn" href="/?space={{ item.space.id }}">进入空间</a>
+      <span class="muted small">{{ item.space.type_count }} 类型 · {{ item.space.name }}</span>
+      {% endif %}
+    </footer>
+  </article>
+  {% endfor %}
+</div>
+
+<section class="panel">
+  <header class="panel-head">
+    <h2>新增一个领域要改什么</h2>
+    <span class="muted small">三步，服务层 / 接口 / 前端零改动</span>
+  </header>
+  <ol class="steps plain">
+    <li>在 <code>server/app/core/ontology/packs/</code> 新建 <code>medical.py</code>，声明 <code>PACK = DomainPack(...)</code></li>
+    <li>把示例语料放进 <code>server/data/samples/medical/</code>，文件名与 <code>SampleDoc.filename</code> 对齐</li>
+    <li>在 <code>packs/__init__.py</code> 的 <code>PACKS</code> 里加一行 <code>medical.PACK</code></li>
+  </ol>
+  <p class="muted small">新增后，该空间的受控词表、检索同义扩展、草案子域提示、Agent 系统提示会一起切换。</p>
+</section>
+{% endblock %}

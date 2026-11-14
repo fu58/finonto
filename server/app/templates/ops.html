@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}运维 · 备份{% endblock %}
+{% block content %}
+<section class="panel">
+  <header class="panel-head">
+    <h1>运维 · 备份</h1>
+    <p class="muted">
+      上线前请把「自检全部通过 + 至少一份可用备份 + 管理员已改密」作为放行条件。
+      同一套检查也可以命令行跑：<code>python scripts/preflight.py</code>。
+    </p>
+  </header>
+
+  {% if message %}
+  <div class="banner info">操作结果：<code>{{ message }}</code></div>
+  {% endif %}
+
+  <div class="stat-grid">
+    <div class="stat"><span>运行时长</span><strong>{{ metrics.uptime_s }}s</strong></div>
+    <div class="stat"><span>请求总数</span><strong>{{ metrics.requests_total }}</strong></div>
+    <div class="stat"><span>5xx</span><strong>{{ metrics.errors_total }}</strong></div>
+    <div class="stat"><span>平均延迟</span><strong>{{ metrics.latency_ms_avg }}ms</strong></div>
+    <div class="stat"><span>最大延迟</span><strong>{{ metrics.latency_ms_max }}ms</strong></div>
+    <div class="stat"><span>活跃会话</span><strong>{{ sessions.active }}</strong></div>
+  </div>
+  <p class="muted small">Prometheus 抓取端点：<a href="/api/metrics" target="_blank">/api/metrics</a> ·
+    就绪探针：<a href="/api/ready" target="_blank">/api/ready</a></p>
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <h2>自检结果</h2>
+    <span class="muted small">
+      ok={{ diagnostics.counts.ok }} · warn={{ diagnostics.counts.warn }} · fail={{ diagnostics.counts.fail }}
+      {% if diagnostics.ready %}<span class="badge ok">可以上线</span>{% else %}<span class="badge err">存在阻塞项</span>{% endif %}
+    </span>
+  </header>
+  <div class="list compact">
+    {% for item in diagnostics.checks %}
+    <div class="row">
+      <div class="row-main">
+        <strong>
+          <span class="badge {{ 'ok' if item.status == 'ok' else 'warn' if item.status == 'warn' else 'err' }}">{{ item.status }}</span>
+          {{ item.title }}
+        </strong>
+        <span class="muted small">{{ item.detail }}</span>
+        {% if item.hint %}<span class="muted small">建议：{{ item.hint }}</span>{% endif %}
+      </div>
+      <div class="row-meta"><code class="small">{{ item.key }}</code></div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<div class="split">
+  <section class="panel">
+    <header class="panel-head"><h2>备份</h2></header>
+    <form class="filter-row" method="post" action="/ops/backup">
+      <input name="note" placeholder="备注（例如：上线前基线）" style="max-width:280px"/>
+      <button class="btn primary" type="submit">立即备份</button>
+    </form>
+    <p class="muted small">
+      SQLite 走官方在线备份 API（WAL 下也一致），无需停服；包内含 <code>finonto.db</code>、
+      <code>objects/</code>、<code>components.json</code> 与恢复说明 <code>RESTORE.md</code>。
+    </p>
+    <div class="list compact">
+      {% for item in backups %}
+      <div class="row">
+        <div class="row-main">
+          <strong>{{ item.name }}</strong>
+          <span class="muted small">{{ item.created_at }} · {{ (item.bytes / 1024) | round(1) }} KB</span>
+        </div>
+        <div class="row-meta">
+          <form method="post" action="/ops/backup/{{ item.name }}/delete"
+                data-confirm="删除备份 {{ item.name }}？">
+            <button class="btn tiny danger" type="submit">删除</button>
+          </form>
+        </div>
+      </div>
+      {% else %}
+      <p class="muted">还没有备份。上线前请至少做一份。</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <header class="panel-head"><h2>运行配置</h2></header>
+    <div class="list compact">
+      <div class="row"><div class="row-main">认证</div><div class="row-meta"><span class="badge {{ 'ok' if settings.auth_enabled else 'warn' }}">{{ '已开启' if settings.auth_enabled else '演示模式' }}</span></div></div>
+      <div class="row"><div class="row-main">限流</div><div class="row-meta"><span class="muted small">{{ settings.rate_limit_per_min }} 次 / 分钟</span></div></div>
+      <div class="row"><div class="row-main">会话有效期</div><div class="row-meta"><span class="muted small">{{ settings.session_ttl_hours }} 小时</span></div></div>
+      <div class="row"><div class="row-main">审计保留</div><div class="row-meta"><span class="muted small">{{ settings.audit_retention_days }} 天</span></div></div>
+      <div class="row"><div class="row-main">数据库</div><div class="row-meta"><code class="small">{{ settings.resolved_database_url() }}</code></div></div>
+      <div class="row"><div class="row-main">数据目录</div><div class="row-meta"><code class="small">{{ settings.data_path }}</code></div></div>
+      <div class="row"><div class="row-main">模型 / 向量</div><div class="row-meta"><span class="muted small">{{ settings.llm_provider }} · {{ settings.embedding_provider }} · {{ settings.vector_store }}</span></div></div>
+    </div>
+  </section>
+</div>
+
+<section class="panel">
+  <header class="panel-head"><h2>恢复步骤</h2></header>
+  <pre class="code-block">{{ restore_hint }}</pre>
+</section>
+{% endblock %}

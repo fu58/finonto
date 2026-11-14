@@ -1,131 +1,120 @@
-"""文档切块策略：按块 -> 段落 -> 句子累积，控制 token 预算与重叠。"""
+"""文档切块：按段落聚合 + 句子级重叠，保留可读的定位信息。
+
+切块质量直接决定 RAG 上限，所以这里做三件事而不是简单按长度截断：
+1. **标题感知**：识别 Markdown 标题与「第X章 / 第X条」，给出人类可读的 locator；
+2. **句子对齐**：只在句子边界切，避免把一句话切成两半；
+3. **重叠回溯**：相邻块保留最后若干句子作重叠，缓解「答案被切断」。
+"""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 
-from ..text import split_sentences
+from ..text import normalize, split_sentences
 
-_CJK = re.compile(r"[一-鿿]")
-
-
-def estimate_tokens(text: str) -> int:
-    """粗略 token 估计：中文按字、其他按 4 字符 1 token。"""
-    if not text:
-        return 0
-    cjk = len(_CJK.findall(text))
-    return cjk + max(1, (len(text) - cjk) // 4)
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+CLAUSE_RE = re.compile(r"^第[一二三四五六七八九十百零\d]+[章节条款]")
+SENTENCE_JOIN = ""
 
 
-@dataclass
-class ChunkDraft:
+@dataclass(slots=True)
+class Chunk:
+    ordinal: int
     text: str
     locator: str
-    tokens: int
-    heading: str = ""
-    page: int | None = None
-    meta: dict | None = None
+    token_count: int
 
 
-def chunk_blocks(
-    blocks,
-    *,
-    max_tokens: int = 420,
-    overlap_tokens: int = 60,
-    min_tokens: int = 40,
-) -> list[ChunkDraft]:
-    """把 ParsedBlock 序列聚合成带定位信息的 chunk；标题参与上下文但不单独成片。"""
-    chunks: list[ChunkDraft] = []
+def _estimate_tokens(text: str) -> int:
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    return cjk + max(0, len(text) - cjk) // 4 + 1
+
+
+def _split_blocks(text: str) -> list[tuple[str, str]]:
+    """返回 [(section_title, block_text)]。"""
+    blocks: list[tuple[str, str]] = []
+    section = ""
     buffer: list[str] = []
-    buffer_tokens = 0
-    locators: list[str] = []
-    headings: list[str] = []
-    pages: list[int] = []
 
-    def push() -> None:
-        nonlocal buffer, buffer_tokens, locators, headings, pages
-        if not buffer:
-            return
-        text = "\n".join(buffer).strip()
-        if text:
+    def flush() -> None:
+        if buffer:
+            joined = normalize("\n".join(buffer))
+            if joined:
+                blocks.append((section, joined))
+            buffer.clear()
+
+    for raw_line in normalize(text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush()
+            continue
+        heading = HEADING_RE.match(line)
+        if heading:
+            flush()
+            section = heading.group(2).strip()
+            continue
+        if CLAUSE_RE.match(line):
+            # 「第X条」自成一段，便于条款级引用
+            flush()
+            buffer.append(line)
+            flush()
+            continue
+        buffer.append(line)
+    flush()
+    return blocks
+
+
+def chunk_text(text: str, *, size: int = 420, overlap: int = 60) -> list[Chunk]:
+    """把文档切成块；``size``/``overlap`` 以字符计（中文≈token）。"""
+    text = normalize(text)
+    if not text:
+        return []
+    size = max(120, int(size))
+    overlap = max(0, min(int(overlap), size // 2))
+
+    chunks: list[Chunk] = []
+    ordinal = 0
+    for section, block in _split_blocks(text):
+        sentences = split_sentences(block)
+        if not sentences:
+            continue
+        current: list[str] = []
+        current_len = 0
+        part_index = 0
+
+        def emit(parts: list[str], part_no: int) -> None:
+            nonlocal ordinal
+            body = SENTENCE_JOIN.join(parts).strip()
+            if not body:
+                return
+            prefix = f"{section} " if section else ""
+            locator = f"{prefix}§{part_no + 1}" if section else f"§{part_no + 1}"
             chunks.append(
-                ChunkDraft(
-                    text=text,
-                    locator="~".join([loc for loc in locators if loc][:3]) or f"chunk-{len(chunks)}",
-                    tokens=estimate_tokens(text),
-                    heading=headings[-1] if headings else "",
-                    page=pages[0] if pages else None,
-                    meta={"heading": headings[-1] if headings else "", "locators": locators[:6]},
+                Chunk(
+                    ordinal=ordinal,
+                    text=body,
+                    locator=locator.strip(),
+                    token_count=_estimate_tokens(body),
                 )
             )
-        if overlap_tokens and buffer_tokens > overlap_tokens:
-            tail = _tail_by_tokens(text, overlap_tokens)
-            buffer = [tail] if tail else []
-            buffer_tokens = estimate_tokens(tail)
-        else:
-            buffer, buffer_tokens = [], 0
-        locators, headings, pages = [], [], []
+            ordinal += 1
 
-    for block in blocks:
-        for sentence in split_sentences(block.text) or [block.text]:
-            sentence_tokens = estimate_tokens(sentence)
-            if sentence_tokens > max_tokens:
-                push()
-                for piece in _split_long(sentence, max_tokens):
-                    chunks.append(
-                        ChunkDraft(
-                            text=piece,
-                            locator=block.locator,
-                            tokens=estimate_tokens(piece),
-                            heading=block.heading,
-                            page=block.page,
-                        )
-                    )
-                continue
-            if buffer_tokens + sentence_tokens > max_tokens and buffer:
-                push()
-            buffer.append(sentence)
-            buffer_tokens += sentence_tokens
-            if block.locator and block.locator not in locators:
-                locators.append(block.locator)
-            if getattr(block, "heading", ""):
-                headings.append(block.heading)
-            if getattr(block, "page", None):
-                pages.append(block.page)
-    push()
-    if min_tokens and chunks:
-        chunks = _merge_undersized(chunks, min_tokens=min_tokens, max_tokens=max_tokens)
+        for sentence in sentences:
+            if current_len + len(sentence) > size and current:
+                emit(current, part_index)
+                part_index += 1
+                # 用尾部句子做重叠
+                tail: list[str] = []
+                tail_len = 0
+                for sentence_back in reversed(current):
+                    if tail_len + len(sentence_back) > overlap:
+                        break
+                    tail.insert(0, sentence_back)
+                    tail_len += len(sentence_back)
+                current = tail
+                current_len = tail_len
+            current.append(sentence)
+            current_len += len(sentence)
+        emit(current, part_index)
     return chunks
-
-
-def _tail_by_tokens(text: str, tokens: int) -> str:
-    sentences = split_sentences(text)
-    tail: list[str] = []
-    total = 0
-    for sentence in reversed(sentences):
-        t = estimate_tokens(sentence)
-        if total + t > tokens:
-            break
-        tail.insert(0, sentence)
-        total += t
-    return " ".join(tail).strip()
-
-
-def _split_long(sentence: str, max_tokens: int) -> list[str]:
-    limit = max(20, max_tokens)
-    window = limit * 2
-    return [sentence[i : i + window] for i in range(0, len(sentence), window)] or [sentence]
-
-
-def _merge_undersized(chunks: list[ChunkDraft], *, min_tokens: int, max_tokens: int) -> list[ChunkDraft]:
-    merged: list[ChunkDraft] = []
-    for chunk in chunks:
-        if merged and chunk.tokens < min_tokens and merged[-1].tokens + chunk.tokens <= max_tokens:
-            prev = merged[-1]
-            prev.text = f"{prev.text}\n{chunk.text}".strip()
-            prev.tokens = estimate_tokens(prev.text)
-            prev.locator = f"{prev.locator}~{chunk.locator}"[:60]
-            continue
-        merged.append(chunk)
-    return merged
