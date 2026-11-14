@@ -1,5 +1,4 @@
-# 开发/测试依赖
--r requirements.txt
+# 开发/测试依赖：运行依赖（含 httpx，starlette TestClient 需要）+ pytest
+-r server/requirements.txt
 
 pytest>=8.0
-httpx>=0.27          # starlette TestClient 依赖（http_smoke.py 用）
